@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Канал</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <h1 id="detail-title">Канал</h1>
+    <p id="meta">Загрузка...</p>
+  </header>
+
+  <main>
+    <div class="grid">
+      <div class="card">
+        <h3>Content Types (ER)</h3>
+        <canvas id="type-pie" width="260" height="260"></canvas>
+        <ul id="type-legend"></ul>
+      </div>
+      <div class="card">
+        <h3>Интеракции по постам</h3>
+        <canvas id="bars" width="640" height="260"></canvas>
+        <div class="hint">по горизонтали посты, столбцы: реакции (синий), ответы (оранжевый), пересылки (фиолетовый)</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Посты (последние)</h3>
+      <div id="posts" class="posts"></div>
+    </div>
+  </main>
+
+  <script src="channel.js"></script>
+</body>
+</html>

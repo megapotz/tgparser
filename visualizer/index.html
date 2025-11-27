@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Channel Visualizer</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <h1>Каналы — статистика</h1>
+    <p>Локальный просмотр данных из SQLite. Клик по строке открывает детали.</p>
+  </header>
+
+  <main>
+    <section id="channels-section">
+      <div class="section-header">
+        <h2>Список каналов</h2>
+        <button id="refresh-btn">Обновить</button>
+      </div>
+      <div class="table-wrap">
+        <table id="channels-table">
+          <thead>
+            <tr>
+              <th data-sort="title">Название</th>
+              <th data-sort="username">Username</th>
+              <th data-sort="members">Подписчики</th>
+              <th data-sort="posts">Постов</th>
+              <th data-sort="avg_views">Avg Views</th>
+              <th data-sort="avg_er">Avg ER</th>
+              <th data-sort="ads">Ads</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

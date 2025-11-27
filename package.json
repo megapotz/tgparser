@@ -4,7 +4,8 @@
   "description": "TDLib-based channel refresher that stores aggregated JSON snapshots in SQLite.",
   "main": "src/refresh-monthly.js",
   "scripts": {
-    "refresh": "node src/refresh-monthly.js"
+    "refresh": "node src/refresh-monthly.js",
+    "visualize": "node scripts/visualize.js"
   },
   "dependencies": {
     "@google/generative-ai": "latest",

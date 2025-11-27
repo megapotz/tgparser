@@ -1,0 +1,31 @@
+* { box-sizing: border-box; }
+body { margin: 0; font-family: Arial, sans-serif; background: #0b1018; color: #e8ecf4; }
+header { padding: 16px 20px; border-bottom: 1px solid #1d2835; background: #0f1623; }
+h1 { margin: 0 0 6px; font-size: 22px; }
+p { margin: 0; color: #9fb1c7; }
+main { padding: 16px 20px 40px; }
+.section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+.section-header h2 { margin: 0; font-size: 18px; }
+.table-wrap { overflow: auto; border: 1px solid #1d2835; border-radius: 8px; }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th, td { padding: 10px 12px; border-bottom: 1px solid #1d2835; }
+th { background: #152033; text-align: left; color: #c5d5e8; position: sticky; top: 0; }
+th[data-sort] { cursor: pointer; }
+tr:hover { background: #152033; cursor: pointer; }
+button { background: #3b82f6; color: #fff; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; font-weight: 600; }
+button:hover { background: #2563eb; }
+.hidden { display: none; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; margin-bottom: 12px; }
+.card { background: #111926; border: 1px solid #1d2835; border-radius: 10px; padding: 14px; }
+.card h3 { margin: 0 0 8px; font-size: 16px; }
+.hint { color: #9fb1c7; font-size: 12px; margin-top: 4px; }
+.posts { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; }
+.post { background: #0f1623; border: 1px solid #1d2835; border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+.post h4 { margin: 0; font-size: 15px; }
+.meta { color: #9fb1c7; font-size: 12px; display: flex; gap: 12px; flex-wrap: wrap; }
+.badge { background: #1d2835; color: #c5d5e8; border-radius: 6px; padding: 2px 8px; font-size: 12px; }
+img.preview { width: 100%; border-radius: 8px; max-height: 200px; object-fit: cover; }
+#type-legend { list-style: none; padding: 0; margin: 8px 0 0; color: #c5d5e8; font-size: 13px; }
+#type-legend li { margin: 4px 0; display: flex; gap: 8px; align-items: center; }
+#type-legend .dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
+@media (max-width: 720px) { th, td { padding: 8px; font-size: 12px; } }
