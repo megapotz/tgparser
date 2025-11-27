@@ -530,6 +530,17 @@ function applyUpdate(upsertChannel, update, chatId = null, supergroupId = null) 
       // Переносим interaction_info в messages JSON не делаем напрямую, но оставляем задел для агрегации.
       break;
     }
+    case "updateChatAvailableReactions": {
+      const targetChatId = typeof update.chat_id === "number" ? update.chat_id : chatId;
+      if (typeof targetChatId === "number") {
+        upsertChannel.run({
+          chat_id: targetChatId,
+          reactions_disabled: reactionsDisabled(update.available_reactions)
+        });
+        logInfo(`update reactions: chat_id=${targetChatId}, disabled=${reactionsDisabled(update.available_reactions)}`);
+      }
+      break;
+    }
     default:
       break;
   }
@@ -812,8 +823,11 @@ async function ensureTranscription(callTd, message) {
 
 function chooseRootMessage(messages) {
   if (!Array.isArray(messages) || messages.length === 0) return null;
-  // Берём самое свежее сообщение — упорядочены по дате desc в TDLib ответе.
-  return messages[0];
+  const withReplies = messages.find(
+    (msg) => Number.isFinite(msg?.interaction_info?.reply_info?.reply_count) && msg.interaction_info.reply_info.reply_count > 0
+  );
+  // Берём самое свежее сообщение с replies, иначе самое свежее вообще.
+  return withReplies || messages[0];
 }
 
 async function main() {
@@ -863,7 +877,7 @@ async function main() {
         }
         applyChatToChannel(upsertChannel, chat, isRknFlag);
         touchRefresh(upsertRefresh, chat.id, "searchPublicChat", "success");
-        logInfo(`searchPublicChat ok: chat_id=${chat.id}`);
+        logInfo(`searchPublicChat ok: chat_id=${chat.id}, title=${chat.title || ""}`);
 
         let supergroupId = null;
         if (isSupergroup(chat)) {
@@ -888,6 +902,7 @@ async function main() {
         // История сообщений пачкой в JSON
         if (isStale(getRefresh, chat.id, "getChatHistory")) {
           try {
+            logInfo(`history request: chat_id=${chat.id}, limit=${HISTORY_FETCH_LIMIT}`);
             const messages = await fetchMessages({
               callTd: (args) => callTdWithDelay(callTd, args),
               callTdFast: callTd,
@@ -903,7 +918,7 @@ async function main() {
             };
             upsertMessagesJson.run({ chat_id: chat.id, messages_json: JSON.stringify(payload), collected_at: payload.collected_at });
             touchRefresh(upsertRefresh, chat.id, "getChatHistory", "success");
-            logInfo(`history ok: ${messages.length}/${HISTORY_FETCH_LIMIT}`);
+            logInfo(`history ok: chat_id=${chat.id}, fetched=${messages.length}/${HISTORY_FETCH_LIMIT}`);
           } catch (histErr) {
             touchRefresh(upsertRefresh, chat.id, "getChatHistory", "error", histErr.code);
             logInfo(`history error: ${histErr.message || histErr}`);
@@ -917,7 +932,7 @@ async function main() {
           if (!linkedChatId) {
             upsertCommentsJson.run({ chat_id: chat.id, payload_json: JSON.stringify(null), collected_at: nowIso() });
             touchRefresh(upsertRefresh, chat.id, "comments", "success");
-            logInfo("comments skip: нет linked_chat_id");
+            logInfo(`comments skip: chat_id=${chat.id} нет linked_chat_id`);
           } else {
             const messagesPayload = db
               .prepare("SELECT messages_json FROM channel_messages WHERE chat_id = ?")
@@ -934,11 +949,11 @@ async function main() {
             if (!rootMessage) {
               upsertCommentsJson.run({ chat_id: chat.id, payload_json: JSON.stringify(null), collected_at: nowIso() });
               touchRefresh(upsertRefresh, chat.id, "comments", "success");
-              logInfo("comments skip: нет сообщений");
+              logInfo(`comments skip: chat_id=${chat.id} нет сообщений/не распарсили history`);
             } else if (!rootMessage.reply_count || rootMessage.reply_count <= 0) {
               upsertCommentsJson.run({ chat_id: chat.id, payload_json: JSON.stringify(null), collected_at: nowIso() });
               touchRefresh(upsertRefresh, chat.id, "comments", "success");
-              logInfo("comments skip: replies=0");
+              logInfo(`comments skip: chat_id=${chat.id} message_id=${rootMessage.id} replies=${rootMessage.reply_count || 0}`);
             } else {
               try {
                 const sinceTimestamp = Math.floor(Date.now() / 1000) - COMMENT_MAX_AGE_SECONDS;
@@ -949,6 +964,9 @@ async function main() {
                 });
                 const threadChatId = threadInfo?.chat_id || linkedChatId || chat.id;
                 const threadMessageId = threadInfo?.message_thread_id || rootMessage.id;
+                logInfo(
+                  `comments fetch: chat_id=${chat.id} linked_chat_id=${linkedChatId} root=${rootMessage.id} replies=${rootMessage.reply_count}`
+                );
                 const comments = await fetchComments({
                   callTd: (args) => callTdWithDelay(callTd, args),
                   chatId: threadChatId,
@@ -959,7 +977,7 @@ async function main() {
                 const payloadJson = comments.length > 0 ? JSON.stringify(comments) : JSON.stringify(null);
                 upsertCommentsJson.run({ chat_id: chat.id, payload_json: payloadJson, collected_at: nowIso() });
                 touchRefresh(upsertRefresh, chat.id, "comments", "success");
-                logInfo(`comments ok: ${comments.length}/${COMMENT_LIMIT_MAX}`);
+                logInfo(`comments ok: chat_id=${chat.id}, fetched=${comments.length}/${COMMENT_LIMIT_MAX}`);
               } catch (commentErr) {
                 touchRefresh(upsertRefresh, chat.id, "comments", "error", commentErr.code);
                 logInfo(`comments error: ${commentErr.message || commentErr}`);
@@ -971,6 +989,7 @@ async function main() {
         // Похожие каналы
         if (isStale(getRefresh, chat.id, "getChatSimilarChats")) {
           try {
+            logInfo(`similar request: chat_id=${chat.id}`);
             const response = await callTdWithDelay(callTd, {
               method: "getChatSimilarChats",
               params: { chat_id: chat.id },
@@ -988,7 +1007,7 @@ async function main() {
             upsertSimilarJson.run({ chat_id: chat.id, items_json: JSON.stringify(items), collected_at: collectedAt });
             upsertChannel.run({ chat_id: chat.id, similar_count: Array.isArray(items) ? items.length : null });
             touchRefresh(upsertRefresh, chat.id, "getChatSimilarChats", "success");
-            logInfo(`similar ok: count=${Array.isArray(items) ? items.length : 0}`);
+            logInfo(`similar ok: chat_id=${chat.id}, count=${Array.isArray(items) ? items.length : 0}`);
           } catch (similarErr) {
             touchRefresh(upsertRefresh, chat.id, "getChatSimilarChats", "error", similarErr.code);
             logInfo(`similar error: ${similarErr.message || similarErr}`);
@@ -1017,6 +1036,7 @@ async function main() {
           }
         }
         const filteredUpdates = filterUpdatesForChat(rawUpdates, chat, extraIds);
+        logInfo(`apply updates: chat_id=${chat.id}, collected=${rawUpdates.length}, filtered=${filteredUpdates.length}`);
         for (const update of filteredUpdates) {
           applyUpdate(upsertChannel, update, chat?.id, supergroupId);
         }
