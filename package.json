@@ -1,0 +1,12 @@
+{
+  "name": "tgparser",
+  "version": "0.1.0",
+  "description": "TDLib-based channel refresher that stores aggregated JSON snapshots in SQLite.",
+  "main": "src/refresh-monthly.js",
+  "scripts": {
+    "refresh": "node src/refresh-monthly.js"
+  },
+  "dependencies": {
+    "tdl": "latest"
+  }
+}

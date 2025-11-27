@@ -1,0 +1,6 @@
+node_modules/
+tdlib/
+media/
+channels.sqlite*
+.env
+*.log
