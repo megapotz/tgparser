@@ -7,6 +7,7 @@
     "refresh": "node src/refresh-monthly.js"
   },
   "dependencies": {
+    "@google/generative-ai": "latest",
     "tdl": "latest"
   }
 }
