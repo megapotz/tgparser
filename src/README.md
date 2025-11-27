@@ -23,6 +23,10 @@ node src/refresh-monthly.js
 - `CHANNEL_LIST_FILE` — путь к списку каналов (по умолчанию `src/l.txt`).
 - `CHANNEL_MEDIA_TEXT_THRESHOLD` — если текст сообщения длиннее порога (по умолчанию 100 символов), превью не скачивается.
 - `SPEECH_RETRY_COUNT` / `SPEECH_RETRY_DELAY_MS` — сколько раз и с какой паузой опрашивать распознавание голоса/кружков (по умолчанию 5 раз, 2000 мс).
+- `CHANNEL_REFRESH_ONLY` — перечисление сущностей через запятую, которые нужно обновить (например, `comments,getChatHistory`).
+- `CHANNEL_REFRESH_SKIP` — перечисление сущностей через запятую, которые нужно пропустить.
+- `CHANNEL_FORCE_REFRESH` — `1/true/yes`, чтобы игнорировать TTL.
+- `TDLIB_RESPONSES_LOG`, `TDLIB_UPDATES_LOG` — пути к ndjson-логам всех ответов/апдейтов TDLib (по умолчанию `td-responses.ndjson`/`td-updates.ndjson` в корне).
 
 ## Что кладётся в БД
 - `channels.is_rkn` — для всех имён из `l.txt` ставится `1`.

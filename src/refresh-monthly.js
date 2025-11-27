@@ -22,7 +22,8 @@ const {
   readChannelList,
   createTdCaller,
   delay,
-  filterUpdatesForChat
+  filterUpdatesForChat,
+  logUpdateEvent
 } = require("../tdlib-helpers");
 const { DB_PATH, MEDIA_ROOT } = require("./config/paths");
 
@@ -31,17 +32,40 @@ const HISTORY_FETCH_LIMIT = Math.max(1, Math.min(Number(process.env.CHANNEL_HIST
 const COMMENT_LIMIT_MIN = Number(process.env.CHANNEL_COMMENT_LIMIT_MIN || 100);
 const COMMENT_LIMIT_MAX = Math.max(COMMENT_LIMIT_MIN, Math.min(Number(process.env.CHANNEL_COMMENT_LIMIT_MAX) || 200, 200));
 const COMMENT_MAX_AGE_SECONDS = Number(process.env.CHANNEL_COMMENT_MAX_AGE_SECONDS || 30 * 24 * 60 * 60); // не старше 30 дней
+const COMMENT_TOTAL_TARGET = Math.min(COMMENT_LIMIT_MAX, 100); // общая цель по комментариям
+const FORCE_REFRESH = ["1", "true", "yes"].includes(String(process.env.CHANNEL_FORCE_REFRESH || "").toLowerCase());
+const ONLY_ENTITIES = (process.env.CHANNEL_REFRESH_ONLY || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const SKIP_ENTITIES = (process.env.CHANNEL_REFRESH_SKIP || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 const STALE_DAYS = Number(process.env.CHANNEL_REFRESH_DAYS || 30);
 const STALE_SECONDS = STALE_DAYS * 24 * 60 * 60;
 const MEDIA_TEXT_THRESHOLD = Number(process.env.CHANNEL_MEDIA_TEXT_THRESHOLD || 100);
 const SPEECH_RETRY_COUNT = Number(process.env.SPEECH_RETRY_COUNT || 5);
 const SPEECH_RETRY_DELAY_MS = Number(process.env.SPEECH_RETRY_DELAY_MS || 2000);
+const REACTIONS_LOG_PATH = process.env.CHANNEL_REACTIONS_LOG || path.join(process.cwd(), "reactions.log");
 
 const updatesByChannel = new Map();
 let currentChannel = null;
 
 function logInfo(message, ...args) {
   console.log(`[refresh] ${message}`, ...args);
+}
+
+async function logReactionsUpdate(update) {
+  try {
+    const payload = {
+      timestamp: new Date().toISOString(),
+      update
+    };
+    await fs.writeFile(REACTIONS_LOG_PATH, JSON.stringify(payload) + "\n", { flag: "a", encoding: "utf8" });
+  } catch (_) {
+    // swallow
+  }
 }
 
 function boolToInt(value) {
@@ -51,8 +75,10 @@ function boolToInt(value) {
 function attachUpdateCollector(client) {
   client.on("update", (update) => {
     if (!currentChannel || !updatesByChannel.has(currentChannel)) {
+      logUpdateEvent(update);
       return;
     }
+    logUpdateEvent(update);
     updatesByChannel.get(currentChannel).push(update);
   });
 }
@@ -308,6 +334,14 @@ function applyFullInfoToChannel(upsertChannel, supergroupId, fullInfo, chatIdOve
 function reactionsDisabled(availableReactions) {
   if (!availableReactions || typeof availableReactions !== "object") return null;
   if (availableReactions._ === "chatAvailableReactionsNone") return 1;
+  if (availableReactions._ === "chatAvailableReactionsSome") {
+    const hasList = Array.isArray(availableReactions.reactions) && availableReactions.reactions.length > 0;
+    const hasMax = Number.isFinite(availableReactions.max_reaction_count) && availableReactions.max_reaction_count > 0;
+    if (!hasList && hasMax) {
+      return 1; // явно ничего нельзя выбрать
+    }
+    return 0;
+  }
   return 0;
 }
 
@@ -537,7 +571,8 @@ function applyUpdate(upsertChannel, update, chatId = null, supergroupId = null) 
           chat_id: targetChatId,
           reactions_disabled: reactionsDisabled(update.available_reactions)
         });
-        logInfo(`update reactions: chat_id=${targetChatId}, disabled=${reactionsDisabled(update.available_reactions)}`);
+        logInfo(`update reactions: chat_id=${targetChatId}, disabled=${reactionsDisabled(update.available_reactions)}`, update);
+        logReactionsUpdate(update);
       }
       break;
     }
@@ -558,6 +593,9 @@ function nowIso() {
 }
 
 function isStale(getRefresh, chatId, entity) {
+  if (FORCE_REFRESH) return true;
+  if (ONLY_ENTITIES.length > 0 && !ONLY_ENTITIES.includes(entity)) return false;
+  if (SKIP_ENTITIES.length > 0 && SKIP_ENTITIES.includes(entity)) return false;
   const row = getRefresh.get(chatId, entity);
   if (!row || !row.last_success_at) return true;
   const last = new Date(row.last_success_at).getTime();
@@ -703,6 +741,8 @@ async function maybeDownloadPreview(callTd, message, chatId, text) {
   if (!content) return null;
 
   if (content._ === "messagePhoto" && Array.isArray(content.photo?.sizes)) {
+    const cached = await findExistingMedia(chatId, String(message.id));
+    if (cached) return cached;
     const best = choosePhotoFile(content.photo.sizes);
     if (!best) return null;
     const localPath = await downloadFile(callTd, best.file_id);
@@ -711,6 +751,8 @@ async function maybeDownloadPreview(callTd, message, chatId, text) {
   }
 
   if (content._ === "messageVideo" && content.video?.thumbnail?.file?.id) {
+    const cached = await findExistingMedia(chatId, `${message.id}_thumb`);
+    if (cached) return cached;
     const fileId = content.video.thumbnail.file.id;
     const localPath = await downloadFile(callTd, fileId);
     if (!localPath) return null;
@@ -757,11 +799,31 @@ async function copyToMedia(srcPath, chatId, filename) {
   try {
     await fs.mkdir(path.join(MEDIA_ROOT, String(chatId)), { recursive: true });
     const targetPath = path.join(MEDIA_ROOT, String(chatId), filename);
+    try {
+      await fs.access(targetPath);
+      return targetPath; // уже есть, не перезаписываем
+    } catch (_) {
+      // fall through to copy
+    }
     await fs.copyFile(srcPath, targetPath);
     return targetPath;
   } catch (error) {
     return null;
   }
+}
+
+async function findExistingMedia(chatId, namePrefix) {
+  try {
+    const dir = path.join(MEDIA_ROOT, String(chatId));
+    const entries = await fs.readdir(dir);
+    const found = entries.find((file) => file.startsWith(namePrefix));
+    if (found) {
+      return path.join(dir, found);
+    }
+  } catch (_) {
+    return null;
+  }
+  return null;
 }
 
 function isVoiceOrCircle(message) {
@@ -821,15 +883,6 @@ async function ensureTranscription(callTd, message) {
   return null;
 }
 
-function chooseRootMessage(messages) {
-  if (!Array.isArray(messages) || messages.length === 0) return null;
-  const withReplies = messages.find(
-    (msg) => Number.isFinite(msg?.interaction_info?.reply_info?.reply_count) && msg.interaction_info.reply_info.reply_count > 0
-  );
-  // Берём самое свежее сообщение с replies, иначе самое свежее вообще.
-  return withReplies || messages[0];
-}
-
 async function main() {
   const stageStartedAt = nowIso();
   let client = null;
@@ -876,6 +929,17 @@ async function main() {
           throw new Error("Чат не найден");
         }
         applyChatToChannel(upsertChannel, chat, isRknFlag);
+        try {
+          const chatDetails = await callTdWithDelay(callTd, {
+            method: "getChat",
+            params: { chat_id: chat.id },
+            responses: []
+          });
+          applyChatToChannel(upsertChannel, chatDetails, isRknFlag);
+          logInfo(`getChat ok: chat_id=${chat.id}`);
+        } catch (_) {
+          // ignore, searchPublicChat data already applied
+        }
         touchRefresh(upsertRefresh, chat.id, "searchPublicChat", "success");
         logInfo(`searchPublicChat ok: chat_id=${chat.id}, title=${chat.title || ""}`);
 
@@ -937,51 +1001,65 @@ async function main() {
             const messagesPayload = db
               .prepare("SELECT messages_json FROM channel_messages WHERE chat_id = ?")
               .get(chat.id);
-            let rootMessage = null;
+            let messagesList = [];
             if (messagesPayload?.messages_json) {
               try {
                 const parsed = JSON.parse(messagesPayload.messages_json);
-                rootMessage = chooseRootMessage(parsed.messages);
+                messagesList = Array.isArray(parsed.messages) ? parsed.messages : [];
               } catch (_) {
-                rootMessage = null;
+                messagesList = [];
               }
             }
-            if (!rootMessage) {
+            const candidates = messagesList
+              .filter((msg) => Number.isFinite(msg?.reply_count) && msg.reply_count > 0)
+              .sort((a, b) => (b.reply_count || 0) - (a.reply_count || 0))
+              .slice(0, 5);
+
+            if (candidates.length === 0) {
               upsertCommentsJson.run({ chat_id: chat.id, payload_json: JSON.stringify(null), collected_at: nowIso() });
               touchRefresh(upsertRefresh, chat.id, "comments", "success");
-              logInfo(`comments skip: chat_id=${chat.id} нет сообщений/не распарсили history`);
-            } else if (!rootMessage.reply_count || rootMessage.reply_count <= 0) {
-              upsertCommentsJson.run({ chat_id: chat.id, payload_json: JSON.stringify(null), collected_at: nowIso() });
-              touchRefresh(upsertRefresh, chat.id, "comments", "success");
-              logInfo(`comments skip: chat_id=${chat.id} message_id=${rootMessage.id} replies=${rootMessage.reply_count || 0}`);
+              logInfo(`comments skip: chat_id=${chat.id} нет сообщений с reply_count>0`);
             } else {
-              try {
-                const sinceTimestamp = Math.floor(Date.now() / 1000) - COMMENT_MAX_AGE_SECONDS;
-                const threadInfo = await callTdWithDelay(callTd, {
-                  method: "getMessageThread",
-                  params: { chat_id: chat.id, message_id: rootMessage.id },
-                  responses: []
-                });
-                const threadChatId = threadInfo?.chat_id || linkedChatId || chat.id;
-                const threadMessageId = threadInfo?.message_thread_id || rootMessage.id;
-                logInfo(
-                  `comments fetch: chat_id=${chat.id} linked_chat_id=${linkedChatId} root=${rootMessage.id} replies=${rootMessage.reply_count}`
-                );
-                const comments = await fetchComments({
-                  callTd: (args) => callTdWithDelay(callTd, args),
-                  chatId: threadChatId,
-                  rootMessageId: threadMessageId,
-                  sinceTimestamp,
-                  limit: COMMENT_LIMIT_MAX
-                });
-                const payloadJson = comments.length > 0 ? JSON.stringify(comments) : JSON.stringify(null);
-                upsertCommentsJson.run({ chat_id: chat.id, payload_json: payloadJson, collected_at: nowIso() });
-                touchRefresh(upsertRefresh, chat.id, "comments", "success");
-                logInfo(`comments ok: chat_id=${chat.id}, fetched=${comments.length}/${COMMENT_LIMIT_MAX}`);
-              } catch (commentErr) {
-                touchRefresh(upsertRefresh, chat.id, "comments", "error", commentErr.code);
-                logInfo(`comments error: ${commentErr.message || commentErr}`);
+              const collected = [];
+              const usedRoots = [];
+              for (const candidate of candidates) {
+                if (collected.length >= COMMENT_TOTAL_TARGET) break;
+                try {
+                  logInfo(`comments fetch start: chat_id=${chat.id} msg=${candidate.id} replies=${candidate.reply_count}`);
+                  const threadInfo = await callTdWithDelay(callTd, {
+                    method: "getMessageThread",
+                    params: { chat_id: chat.id, message_id: candidate.id },
+                    responses: []
+                  });
+                  const sinceTimestamp = Math.floor(Date.now() / 1000) - COMMENT_MAX_AGE_SECONDS;
+                  const threadChatId = threadInfo?.chat_id || linkedChatId || chat.id;
+                  const threadMessageId = threadInfo?.message_thread_id || candidate.id;
+                  const remaining = Math.max(0, COMMENT_TOTAL_TARGET - collected.length);
+                  const comments = await fetchComments({
+                    callTd: (args) => callTdWithDelay(callTd, args),
+                    chatId: threadChatId,
+                    rootMessageId: threadMessageId,
+                    sinceTimestamp,
+                    limit: Math.min(remaining, COMMENT_LIMIT_MAX)
+                  });
+                  if (comments.length > 0) {
+                    collected.push(...comments);
+                    usedRoots.push(candidate.id);
+                    logInfo(`comments chunk: chat_id=${chat.id} msg=${candidate.id} got=${comments.length} total=${collected.length}`);
+                  } else {
+                    logInfo(`comments chunk empty: chat_id=${chat.id} msg=${candidate.id}`);
+                  }
+                } catch (err) {
+                  logInfo(`comments error: chat_id=${chat.id} msg=${candidate.id} ${err.message || err}`);
+                }
               }
+
+              const payloadJson = collected.length > 0 ? JSON.stringify(collected.slice(0, COMMENT_TOTAL_TARGET)) : JSON.stringify(null);
+              upsertCommentsJson.run({ chat_id: chat.id, payload_json: payloadJson, collected_at: nowIso() });
+              touchRefresh(upsertRefresh, chat.id, "comments", "success");
+              logInfo(
+                `comments done: chat_id=${chat.id}, fetched=${collected.length}/${COMMENT_TOTAL_TARGET}, roots=${usedRoots.join(",") || "none"}`
+              );
             }
           }
         }
@@ -995,14 +1073,13 @@ async function main() {
               params: { chat_id: chat.id },
               responses: []
             });
-            const rawItems = Array.isArray(response?.chat_ids)
+            const items = Array.isArray(response?.chat_ids)
               ? response.chat_ids
               : Array.isArray(response?.chats)
               ? response.chats
               : Array.isArray(response)
               ? response
               : [];
-            const items = normalizeSimilarItems(rawItems);
             const collectedAt = nowIso();
             upsertSimilarJson.run({ chat_id: chat.id, items_json: JSON.stringify(items), collected_at: collectedAt });
             upsertChannel.run({ chat_id: chat.id, similar_count: Array.isArray(items) ? items.length : null });

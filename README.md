@@ -10,6 +10,10 @@
    - `CHANNEL_LIST_FILE` — список каналов (по умолчанию `src/l.txt`).
    - `CHANNEL_DB_PATH` — путь к SQLite (по умолчанию `channels.sqlite` в корне).
    - `CHANNEL_MEDIA_DIR` — куда складывать скачанные превью (по умолчанию `media/`).
+   - `CHANNEL_REFRESH_ONLY` — перечисление сущностей через запятую, чтобы обновить только их (`searchPublicChat`, `getSupergroupFullInfo`, `getChatHistory`, `comments`, `getChatSimilarChats`).
+   - `CHANNEL_REFRESH_SKIP` — перечисление сущностей через запятую, которые нужно пропустить (та же номенклатура).
+   - `CHANNEL_FORCE_REFRESH` — `1/true/yes`, чтобы игнорировать TTL и перезапросить всё выбранное.
+   - `TDLIB_RESPONSES_LOG`, `TDLIB_UPDATES_LOG` — пути для логов всех TDLib ответов/апдейтов (`*.ndjson`, по умолчанию в корне `td-responses.ndjson`, `td-updates.ndjson`).
 3. Запуск обновления: `npm run refresh`.
 
 ## Что делает refresh-monthly

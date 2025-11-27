@@ -13,6 +13,8 @@ const HISTORY_LIMIT = Number(process.env.CHANNEL_HISTORY_LIMIT || 100);
 const COMMENTS_LIMIT = Number(process.env.CHANNEL_COMMENTS_LIMIT || 100);
 const OUTPUT_ROOT = process.env.CHANNEL_OUTPUT_ROOT || process.cwd();
 const OUTPUT_SUBDIR = process.env.CHANNEL_OUTPUT_SUBDIR || "full";
+const LOG_RESPONSES_PATH = process.env.TDLIB_RESPONSES_LOG || path.join(process.cwd(), "td-responses.ndjson");
+const LOG_UPDATES_PATH = process.env.TDLIB_UPDATES_LOG || path.join(process.cwd(), "td-updates.ndjson");
 
 const tdDatabaseDir = TDLIB_DATABASE_DIR;
 const tdFilesDir = TDLIB_FILES_DIR;
@@ -114,16 +116,34 @@ function responseEntry(method, params, payload, error) {
   return entry;
 }
 
+async function appendLog(filePath, payload) {
+  try {
+    await fs.appendFile(filePath, JSON.stringify(payload) + "\n", "utf8");
+  } catch (_) {
+    // ignore logging errors
+  }
+}
+
+function logUpdateEvent(update) {
+  const payload = { timestamp: new Date().toISOString(), update };
+  // fire and forget
+  appendLog(LOG_UPDATES_PATH, payload);
+}
+
 function createTdCaller(client) {
   return async function callTd({ method, params, responses, suppressError = false }) {
     console.log(`TDLib -> ${method}`);
 
     try {
       const payload = await client.invoke({ _: method, ...params });
-      responses.push(responseEntry(method, params, payload));
+      const entry = responseEntry(method, params, payload);
+      responses.push(entry);
+      appendLog(LOG_RESPONSES_PATH, entry);
       return payload;
     } catch (error) {
-      responses.push(responseEntry(method, params, undefined, error));
+      const entry = responseEntry(method, params, undefined, error);
+      responses.push(entry);
+      appendLog(LOG_RESPONSES_PATH, entry);
       if (suppressError) {
         return null;
       }
@@ -299,6 +319,8 @@ module.exports = {
   OUTPUT_SUBDIR,
   tdDatabaseDir,
   tdFilesDir,
+  LOG_RESPONSES_PATH,
+  LOG_UPDATES_PATH,
   ensureDirectories,
   createClient,
   login,
@@ -307,5 +329,6 @@ module.exports = {
   writeJson,
   delay,
   filterUpdatesForChat,
-  keepOnlyLatestUpdates
+  keepOnlyLatestUpdates,
+  logUpdateEvent
 };
