@@ -27,12 +27,12 @@ const {
 } = require("../tdlib-helpers");
 const { DB_PATH, MEDIA_ROOT } = require("./config/paths");
 
-const REQUEST_DELAY_MS = Number(process.env.TDLIB_REQUEST_DELAY_MS || 1000);
-const HISTORY_FETCH_LIMIT = Math.max(1, Math.min(Number(process.env.CHANNEL_HISTORY_FETCH_LIMIT) || 100, 100));
+const REQUEST_DELAY_MS = Number(process.env.TDLIB_REQUEST_DELAY_MS || 3000);
+const HISTORY_FETCH_LIMIT = Math.max(1, Number(process.env.CHANNEL_HISTORY_FETCH_LIMIT) || 100);
 const COMMENT_LIMIT_MIN = Number(process.env.CHANNEL_COMMENT_LIMIT_MIN || 100);
 const COMMENT_LIMIT_MAX = Math.max(COMMENT_LIMIT_MIN, Math.min(Number(process.env.CHANNEL_COMMENT_LIMIT_MAX) || 200, 200));
+const COMMENT_TOTAL_TARGET = Number(process.env.CHANNEL_COMMENT_TOTAL_TARGET || COMMENT_LIMIT_MAX); // сколько максимум собираем за раз
 const COMMENT_MAX_AGE_SECONDS = Number(process.env.CHANNEL_COMMENT_MAX_AGE_SECONDS || 30 * 24 * 60 * 60); // не старше 30 дней
-const COMMENT_TOTAL_TARGET = Math.min(COMMENT_LIMIT_MAX, 100); // общая цель по комментариям
 const FORCE_REFRESH = ["1", "true", "yes"].includes(String(process.env.CHANNEL_FORCE_REFRESH || "").toLowerCase());
 const ONLY_ENTITIES = (process.env.CHANNEL_REFRESH_ONLY || "")
   .split(",")
@@ -42,15 +42,17 @@ const SKIP_ENTITIES = (process.env.CHANNEL_REFRESH_SKIP || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
-const STALE_DAYS = Number(process.env.CHANNEL_REFRESH_DAYS || 30);
-const STALE_SECONDS = STALE_DAYS * 24 * 60 * 60;
+// По умолчанию не рефрешим, а только заполняем дыры; включить таймер можно через CHANNEL_REFRESH_DAYS>0
+const STALE_DAYS = Number(process.env.CHANNEL_REFRESH_DAYS ?? -1);
+const STALE_SECONDS = STALE_DAYS > 0 ? STALE_DAYS * 24 * 60 * 60 : null;
 const MEDIA_TEXT_THRESHOLD = Number(process.env.CHANNEL_MEDIA_TEXT_THRESHOLD || 100);
-const SPEECH_RETRY_COUNT = Number(process.env.SPEECH_RETRY_COUNT || 5);
-const SPEECH_RETRY_DELAY_MS = Number(process.env.SPEECH_RETRY_DELAY_MS || 2000);
+const SPEECH_WAIT_TIMEOUT_MS = Number(process.env.SPEECH_WAIT_TIMEOUT_MS || 20000);
 const REACTIONS_LOG_PATH = process.env.CHANNEL_REACTIONS_LOG || path.join(process.cwd(), "reactions.log");
 
 const updatesByChannel = new Map();
 let currentChannel = null;
+const pendingTranscriptions = new Map();
+let rknUsernames = new Set();
 
 function logInfo(message, ...args) {
   console.log(`[refresh] ${message}`, ...args);
@@ -72,8 +74,45 @@ function boolToInt(value) {
   return value ? 1 : 0;
 }
 
+function normalizeUsername(name) {
+  if (!name || typeof name !== "string") return null;
+  return name.trim().toLowerCase();
+}
+
+function isRknByChat(chat) {
+  if (!chat) return false;
+  const usernames = [];
+  if (Array.isArray(chat.usernames?.active_usernames)) {
+    usernames.push(...chat.usernames.active_usernames);
+  }
+  if (typeof chat.username === "string") {
+    usernames.push(chat.username);
+  }
+  for (const name of usernames) {
+    const norm = normalizeUsername(name);
+    if (norm && rknUsernames.has(norm)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasEnoughMembers(update) {
+  const mc =
+    update?.supergroup?.member_count ??
+    update?.supergroup_full_info?.member_count ??
+    update?.chat?.member_count ??
+    update?.message?.chat_member_count;
+  if (typeof mc === "number") {
+    return mc >= 800;
+  }
+  return true; // если информации нет, сохраняем
+}
+
 function attachUpdateCollector(client) {
   client.on("update", (update) => {
+    maybeResolveTranscriptionFromUpdate(update);
+
     if (!currentChannel || !updatesByChannel.has(currentChannel)) {
       logUpdateEvent(update);
       return;
@@ -234,8 +273,11 @@ function initDb(dbPath) {
 
   const getRefresh = db.prepare(`SELECT * FROM refresh_state WHERE chat_id = ? AND entity = ? LIMIT 1;`);
   const getChannel = db.prepare(`SELECT * FROM channels WHERE chat_id = ? LIMIT 1;`);
+  const getChannelByUsername = db.prepare(`SELECT * FROM channels WHERE active_username = ? LIMIT 1;`);
 
   ensureColumn("channels", "reactions_disabled", "INTEGER");
+  ensureColumn("channels", "active_username", "TEXT");
+  ensureColumn("channels", "is_verified", "INTEGER");
 
   return {
     db,
@@ -245,7 +287,8 @@ function initDb(dbPath) {
     upsertSimilarJson,
     upsertRefresh,
     getRefresh,
-    getChannel
+    getChannel,
+    getChannelByUsername
   };
 }
 
@@ -274,11 +317,19 @@ function extractPhotoIds(photo) {
 
 function applyChatToChannel(upsertChannel, chat, isRkn = null) {
   if (!chat || typeof chat.id !== "number") return;
+  const primaryUsername =
+    Array.isArray(chat.usernames?.active_usernames) && chat.usernames.active_usernames.length > 0
+      ? chat.usernames.active_usernames[0]
+      : null;
+  const isVerified =
+    typeof chat.verification_status?.is_verified === "boolean" ? boolToInt(chat.verification_status.is_verified) : null;
   const params = {
     chat_id: chat.id,
     title: chat.title || null,
     supergroup_id: isSupergroup(chat) ? chat.type.supergroup_id : null,
     is_rkn: isRkn !== null ? boolToInt(Boolean(isRkn)) : null,
+    active_username: primaryUsername,
+    is_verified: isVerified,
     reactions_disabled: reactionsDisabled(chat.available_reactions)
   };
   upsertChannel.run(params);
@@ -543,35 +594,60 @@ function mapInteractionToJson(chatId, messageId, interactionInfo) {
   return row;
 }
 
-function applyUpdate(upsertChannel, update, chatId = null, supergroupId = null) {
+function applyUpdate(upsertChannel, update, fallbackChatId = null, fallbackSupergroupId = null) {
   if (!update || typeof update !== "object") return;
+
+  const updateChatId =
+    typeof update.chat_id === "number"
+      ? update.chat_id
+      : typeof update.chat?.id === "number"
+      ? update.chat.id
+      : typeof update.message?.chat_id === "number"
+      ? update.message.chat_id
+      : null;
+
+  const updateSupergroupId =
+    typeof update.supergroup?.id === "number"
+      ? update.supergroup.id
+      : typeof update.supergroup_id === "number"
+      ? update.supergroup_id
+      : typeof update.chat?.type?.supergroup_id === "number"
+      ? update.chat.type.supergroup_id
+      : null;
+
   switch (update._) {
     case "updateNewChat":
-      applyChatToChannel(upsertChannel, update.chat);
+      if (!fallbackChatId || updateChatId === fallbackChatId || hasEnoughMembers(update)) {
+        applyChatToChannel(upsertChannel, update.chat, isRknByChat(update.chat));
+      }
       break;
-    case "updateSupergroup":
-      applySupergroupToChannel(upsertChannel, update.supergroup, chatId || toChatIdFromSupergroup(update.supergroup?.id));
+    case "updateSupergroup": {
+      const targetChatId = updateChatId || toChatIdFromSupergroup(updateSupergroupId) || fallbackChatId;
+      if (!fallbackChatId || targetChatId === fallbackChatId || hasEnoughMembers(update)) {
+        applySupergroupToChannel(upsertChannel, update.supergroup, targetChatId);
+      }
       break;
-    case "updateSupergroupFullInfo":
-      applyFullInfoToChannel(
-        upsertChannel,
-        typeof update.supergroup_id === "number" ? update.supergroup_id : supergroupId,
-        update.supergroup_full_info,
-        chatId || toChatIdFromSupergroup(update.supergroup_id)
-      );
+    }
+    case "updateSupergroupFullInfo": {
+      const sgId = updateSupergroupId || fallbackSupergroupId;
+      const targetChatId = updateChatId || toChatIdFromSupergroup(sgId) || fallbackChatId;
+      if (!fallbackChatId || targetChatId === fallbackChatId || hasEnoughMembers(update)) {
+        applyFullInfoToChannel(upsertChannel, sgId, update.supergroup_full_info, targetChatId);
+      }
       break;
+    }
     case "updateMessageInteractionInfo": {
       // Переносим interaction_info в messages JSON не делаем напрямую, но оставляем задел для агрегации.
       break;
     }
     case "updateChatAvailableReactions": {
-      const targetChatId = typeof update.chat_id === "number" ? update.chat_id : chatId;
+      const targetChatId = updateChatId || fallbackChatId;
       if (typeof targetChatId === "number") {
         upsertChannel.run({
           chat_id: targetChatId,
           reactions_disabled: reactionsDisabled(update.available_reactions)
         });
-        logInfo(`update reactions: chat_id=${targetChatId}, disabled=${reactionsDisabled(update.available_reactions)}`, update);
+        logInfo(`update reactions: chat_id=${targetChatId}, disabled=${reactionsDisabled(update.available_reactions)}`);
         logReactionsUpdate(update);
       }
       break;
@@ -585,11 +661,31 @@ async function callTdWithDelay(callTd, args) {
   if (REQUEST_DELAY_MS > 0) {
     await delay(REQUEST_DELAY_MS);
   }
-  return callTd(args);
+  try {
+    return await callTd(args);
+  } catch (error) {
+    abortOnFlood(error);
+    throw error;
+  }
 }
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function isFloodError(error) {
+  if (!error) return false;
+  if (Number(error.code) === 429) return true;
+  const message = String(error.message || error || "").toUpperCase();
+  return message.includes("FLOOD") || message.includes("TOO MANY REQUESTS");
+}
+
+function abortOnFlood(error) {
+  if (isFloodError(error)) {
+    const ts = nowIso();
+    console.error(`[refresh] FLOOD detected at ${ts}: ${error.message || error}`);
+    throw error;
+  }
 }
 
 function isStale(getRefresh, chatId, entity) {
@@ -598,10 +694,23 @@ function isStale(getRefresh, chatId, entity) {
   if (SKIP_ENTITIES.length > 0 && SKIP_ENTITIES.includes(entity)) return false;
   const row = getRefresh.get(chatId, entity);
   if (!row || !row.last_success_at) return true;
+  if (STALE_SECONDS === null) return false; // таймер отключён, данных достаточно
   const last = new Date(row.last_success_at).getTime();
   if (!Number.isFinite(last)) return true;
   const ageMs = Date.now() - last;
   return ageMs > STALE_SECONDS * 1000;
+}
+
+function allEntitiesFresh(getRefresh, chatId) {
+  if (!chatId) return false;
+  const targetsBase = ["searchPublicChat", "getSupergroup", "getSupergroupFullInfo", "getChatHistory", "comments", "getChatSimilarChats"];
+  const targets = targetsBase.filter((entity) => {
+    if (ONLY_ENTITIES.length > 0 && !ONLY_ENTITIES.includes(entity)) return false;
+    if (SKIP_ENTITIES.length > 0 && SKIP_ENTITIES.includes(entity)) return false;
+    return true;
+  });
+  if (targets.length === 0) return false;
+  return targets.every((entity) => !isStale(getRefresh, chatId, entity));
 }
 
 function touchRefresh(upsertRefresh, chatId, entity, status, errorCode = null) {
@@ -619,25 +728,38 @@ function touchRefresh(upsertRefresh, chatId, entity, status, errorCode = null) {
 
 async function fetchMessages({ callTd, callTdFast, chatId, limit }) {
   const messages = [];
+  const batchStats = [];
   let fromMessageId = 0;
-  while (messages.length < limit) {
-    if (REQUEST_DELAY_MS > 0 && messages.length > 0) {
+  let totalRaw = 0;
+
+  while (totalRaw < limit) {
+    if (REQUEST_DELAY_MS > 0 && batchStats.length > 0) {
       await delay(REQUEST_DELAY_MS);
     }
-    const batchLimit = Math.min(limit - messages.length, 100);
+    const remaining = limit - totalRaw;
+    const batchLimit = Math.min(remaining, 100);
     const batch = await callTd({
       method: "getChatHistory",
       params: { chat_id: chatId, from_message_id: fromMessageId, offset: 0, limit: batchLimit },
       responses: []
     });
     const batchMessages = Array.isArray(batch?.messages) ? batch.messages : [];
+    batchStats.push({
+      requested: batchLimit,
+      received: batchMessages.length,
+      from_message_id: fromMessageId
+    });
+    logInfo(
+      `history batch: chat_id=${chatId}, batch=${batchStats.length}, requested=${batchLimit}, got=${batchMessages.length}, total_raw=${totalRaw + batchMessages.length}, total_kept=${messages.length}`
+    );
     if (batchMessages.length === 0) break;
+
     for (const message of batchMessages) {
       const mapped = mapMessageToJson(message);
       if (mapped) {
         mapped.media_local_path = await maybeDownloadPreview(callTdFast, message, chatId, mapped.text_markdown);
         if (isVoiceOrCircle(message)) {
-          const transcript = await ensureTranscription(callTdFast, message);
+          const transcript = await ensureTranscription(callTd, message);
           if (transcript) {
             mapped.transcription = transcript;
           }
@@ -645,12 +767,19 @@ async function fetchMessages({ callTd, callTdFast, chatId, limit }) {
         messages.push(mapped);
       }
     }
+
+    totalRaw += batchMessages.length;
+    if (batchMessages.length < batchLimit) {
+      break; // данных меньше, дальше не спрашиваем
+    }
+
     const last = batchMessages[batchMessages.length - 1];
     const nextFrom = typeof last?.id === "number" ? last.id : 0;
     if (!nextFrom || nextFrom === fromMessageId) break;
     fromMessageId = nextFrom;
   }
-  return messages;
+
+  return { messages, batchStats, totalRaw };
 }
 
 async function fetchComments({ callTd, chatId, rootMessageId, sinceTimestamp, limit }) {
@@ -791,6 +920,7 @@ async function downloadFile(callTd, fileId) {
     if (localPath) return localPath;
     return null;
   } catch (error) {
+    abortOnFlood(error);
     return null;
   }
 }
@@ -841,6 +971,67 @@ function extractSpeechText(message) {
   return null;
 }
 
+function transcriptionKey(chatId, messageId) {
+  return `${chatId}:${messageId}`;
+}
+
+function resolvePendingTranscription(chatId, messageId, text) {
+  const key = transcriptionKey(chatId, messageId);
+  const pending = pendingTranscriptions.get(key);
+  if (!pending) return;
+  clearTimeout(pending.timer);
+  pendingTranscriptions.delete(key);
+  pending.resolve(text || null);
+}
+
+function cancelPendingTranscription(chatId, messageId) {
+  const key = transcriptionKey(chatId, messageId);
+  const pending = pendingTranscriptions.get(key);
+  if (!pending) return;
+  clearTimeout(pending.timer);
+  pendingTranscriptions.delete(key);
+  pending.resolve(null);
+}
+
+function waitForTranscription(chatId, messageId) {
+  const key = transcriptionKey(chatId, messageId);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      pendingTranscriptions.delete(key);
+      resolve(null);
+    }, SPEECH_WAIT_TIMEOUT_MS);
+    pendingTranscriptions.set(key, { resolve, timer });
+  });
+}
+
+function maybeResolveTranscriptionFromUpdate(update) {
+  if (!update || typeof update !== "object") return;
+  let chatId = null;
+  let messageId = null;
+  let content = null;
+
+  switch (update._) {
+    case "updateMessageContent":
+      chatId = update.chat_id;
+      messageId = update.message_id;
+      content = update.new_content;
+      break;
+    case "updateNewMessage":
+      chatId = update.message?.chat_id;
+      messageId = update.message?.id;
+      content = update.message?.content;
+      break;
+    default:
+      return;
+  }
+
+  if (!chatId || !messageId || !content) return;
+  const text = extractSpeechText({ content });
+  if (text) {
+    resolvePendingTranscription(chatId, messageId, text);
+  }
+}
+
 async function ensureTranscription(callTd, message) {
   const initial = extractSpeechText(message);
   if (initial) return initial;
@@ -849,7 +1040,7 @@ async function ensureTranscription(callTd, message) {
   const chatId = message.chat_id;
   const messageId = message.id;
   if (!chatId || !messageId) return null;
-
+  const waitPromise = waitForTranscription(chatId, messageId);
   try {
     await callTd({
       method: "recognizeSpeech",
@@ -857,30 +1048,25 @@ async function ensureTranscription(callTd, message) {
       responses: []
     });
   } catch (error) {
+    abortOnFlood(error);
+    cancelPendingTranscription(chatId, messageId);
     return null;
   }
+  const textFromUpdate = await waitPromise;
+  if (textFromUpdate) return textFromUpdate;
 
-  for (let attempt = 0; attempt < SPEECH_RETRY_COUNT; attempt += 1) {
-    if (attempt > 0 && SPEECH_RETRY_DELAY_MS > 0) {
-      await delay(SPEECH_RETRY_DELAY_MS);
-    }
-
-    try {
-      const fresh = await callTd({
-        method: "getMessage",
-        params: { chat_id: chatId, message_id: messageId },
-        responses: []
-      });
-      const text = extractSpeechText(fresh);
-      if (text) {
-        return text;
-      }
-    } catch (error) {
-      // ignore poll errors
-    }
+  // Одно финальное чтение, если апдейт не пришёл вовремя
+  try {
+    const fresh = await callTd({
+      method: "getMessage",
+      params: { chat_id: chatId, message_id: messageId },
+      responses: []
+    });
+    return extractSpeechText(fresh);
+  } catch (error) {
+    abortOnFlood(error);
+    return null;
   }
-
-  return null;
 }
 
 async function main() {
@@ -894,7 +1080,8 @@ async function main() {
     upsertSimilarJson,
     upsertRefresh,
     getRefresh,
-    getChannel
+    getChannel,
+    getChannelByUsername
   } = initDb(DB_PATH);
 
   try {
@@ -906,6 +1093,7 @@ async function main() {
     const callTd = createTdCaller(client);
 
     const channelNames = await readChannelList(CHANNEL_LIST_FILE);
+    rknUsernames = new Set(channelNames.map((name) => normalizeUsername(name)).filter(Boolean));
     if (channelNames.length === 0) {
       console.log("Список каналов пуст, ничего не делаю.");
       return;
@@ -915,6 +1103,15 @@ async function main() {
       updatesByChannel.set(channelName, []);
       currentChannel = channelName;
       logInfo(`Начинаю ${channelName}`);
+
+      const existing = getChannelByUsername.get(channelName);
+      const existingChatId = existing?.chat_id;
+      if (!FORCE_REFRESH && STALE_SECONDS === null && allEntitiesFresh(getRefresh, existingChatId)) {
+        logInfo(`Пропускаю ${channelName}: всё актуально (chat_id=${existingChatId || "n/a"})`);
+        updatesByChannel.set(channelName, []);
+        currentChannel = null;
+        continue;
+      }
 
       try {
         const isRknFlag = true; // все из списка l.txt считаем is_rkn=true
@@ -946,6 +1143,22 @@ async function main() {
         let supergroupId = null;
         if (isSupergroup(chat)) {
           supergroupId = chat.type.supergroup_id;
+          if (isStale(getRefresh, chat.id, "getSupergroup")) {
+            try {
+              const supergroup = await callTdWithDelay(callTd, {
+                method: "getSupergroup",
+                params: { supergroup_id: supergroupId },
+                responses: []
+              });
+              applySupergroupToChannel(upsertChannel, supergroup, chat.id);
+              touchRefresh(upsertRefresh, chat.id, "getSupergroup", "success");
+              logInfo(`getSupergroup ok: supergroup_id=${supergroupId}`);
+            } catch (sgErr) {
+              abortOnFlood(sgErr);
+              touchRefresh(upsertRefresh, chat.id, "getSupergroup", "error", sgErr.code);
+              logInfo(`getSupergroup error: ${sgErr.message || sgErr}`);
+            }
+          }
           if (isStale(getRefresh, chat.id, "getSupergroupFullInfo")) {
             try {
               const fullInfo = await callTdWithDelay(callTd, {
@@ -957,6 +1170,7 @@ async function main() {
               touchRefresh(upsertRefresh, chat.id, "getSupergroupFullInfo", "success");
               logInfo(`fullInfo ok: supergroup_id=${supergroupId}`);
             } catch (fullErr) {
+              abortOnFlood(fullErr);
               touchRefresh(upsertRefresh, chat.id, "getSupergroupFullInfo", "error", fullErr.code);
               logInfo(`fullInfo error: ${fullErr.message || fullErr}`);
             }
@@ -967,7 +1181,7 @@ async function main() {
         if (isStale(getRefresh, chat.id, "getChatHistory")) {
           try {
             logInfo(`history request: chat_id=${chat.id}, limit=${HISTORY_FETCH_LIMIT}`);
-            const messages = await fetchMessages({
+            const { messages, batchStats, totalRaw } = await fetchMessages({
               callTd: (args) => callTdWithDelay(callTd, args),
               callTdFast: callTd,
               chatId: chat.id,
@@ -976,14 +1190,19 @@ async function main() {
             const payload = {
               chat_id: chat.id,
               fetched_count: messages.length,
+              fetched_raw: totalRaw,
+              batches: batchStats,
               limit: HISTORY_FETCH_LIMIT,
               collected_at: nowIso(),
               messages
             };
             upsertMessagesJson.run({ chat_id: chat.id, messages_json: JSON.stringify(payload), collected_at: payload.collected_at });
             touchRefresh(upsertRefresh, chat.id, "getChatHistory", "success");
-            logInfo(`history ok: chat_id=${chat.id}, fetched=${messages.length}/${HISTORY_FETCH_LIMIT}`);
+            logInfo(
+              `history ok: chat_id=${chat.id}, fetched=${messages.length}/${HISTORY_FETCH_LIMIT}, raw=${totalRaw}, batches=${batchStats.length}`
+            );
           } catch (histErr) {
+            abortOnFlood(histErr);
             touchRefresh(upsertRefresh, chat.id, "getChatHistory", "error", histErr.code);
             logInfo(`history error: ${histErr.message || histErr}`);
           }
@@ -1015,10 +1234,16 @@ async function main() {
               .sort((a, b) => (b.reply_count || 0) - (a.reply_count || 0))
               .slice(0, 5);
 
+            const totalReplies = candidates.reduce((sum, msg) => sum + (msg.reply_count || 0), 0);
+
             if (candidates.length === 0) {
               upsertCommentsJson.run({ chat_id: chat.id, payload_json: JSON.stringify(null), collected_at: nowIso() });
               touchRefresh(upsertRefresh, chat.id, "comments", "success");
               logInfo(`comments skip: chat_id=${chat.id} нет сообщений с reply_count>0`);
+            } else if (totalReplies < 30) {
+              upsertCommentsJson.run({ chat_id: chat.id, payload_json: JSON.stringify(null), collected_at: nowIso() });
+              touchRefresh(upsertRefresh, chat.id, "comments", "success");
+              logInfo(`comments skip: chat_id=${chat.id} суммарно мало комментариев (replies=${totalReplies})`);
             } else {
               const collected = [];
               const usedRoots = [];
@@ -1050,11 +1275,12 @@ async function main() {
                     logInfo(`comments chunk empty: chat_id=${chat.id} msg=${candidate.id}`);
                   }
                 } catch (err) {
+                  abortOnFlood(err);
                   logInfo(`comments error: chat_id=${chat.id} msg=${candidate.id} ${err.message || err}`);
                 }
               }
 
-              const payloadJson = collected.length > 0 ? JSON.stringify(collected.slice(0, COMMENT_TOTAL_TARGET)) : JSON.stringify(null);
+              const payloadJson = collected.length > 0 ? JSON.stringify(collected) : JSON.stringify(null);
               upsertCommentsJson.run({ chat_id: chat.id, payload_json: payloadJson, collected_at: nowIso() });
               touchRefresh(upsertRefresh, chat.id, "comments", "success");
               logInfo(
@@ -1086,6 +1312,7 @@ async function main() {
             touchRefresh(upsertRefresh, chat.id, "getChatSimilarChats", "success");
             logInfo(`similar ok: chat_id=${chat.id}, count=${Array.isArray(items) ? items.length : 0}`);
           } catch (similarErr) {
+            abortOnFlood(similarErr);
             touchRefresh(upsertRefresh, chat.id, "getChatSimilarChats", "error", similarErr.code);
             logInfo(`similar error: ${similarErr.message || similarErr}`);
           }
@@ -1118,6 +1345,7 @@ async function main() {
           applyUpdate(upsertChannel, update, chat?.id, supergroupId);
         }
       } catch (error) {
+        abortOnFlood(error);
         logInfo(`Ошибка по ${channelName}: ${error.message || error}`);
       } finally {
         updatesByChannel.set(channelName, []);
@@ -1125,7 +1353,8 @@ async function main() {
       }
     }
   } catch (error) {
-    console.error("Скрипт завершился с ошибкой:", error.message || error);
+    const ts = nowIso();
+    console.error(`Скрипт завершился с ошибкой (${ts}):`, error.message || error);
   } finally {
     currentChannel = null;
     if (client) {
