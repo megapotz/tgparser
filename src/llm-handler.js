@@ -3,9 +3,9 @@
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const { DatabaseSync } = require("node:sqlite");
-let GoogleGenerativeAI = null;
+let GoogleGenAI = null;
 try {
-  ({ GoogleGenerativeAI } = require("@google/generative-ai"));
+  ({ GoogleGenAI } = require("@google/genai"));
 } catch (_) {
   // Библиотека подтянется после установки зависимостей
 }
@@ -212,16 +212,16 @@ class GeminiHandler {
     this.apiKey = apiKey;
     this.model = null;
 
-    if (this.apiKey && GoogleGenerativeAI) {
+    if (this.apiKey && GoogleGenAI) {
       try {
-        const client = new GoogleGenerativeAI(this.apiKey);
+        const client = new GoogleGenAI({ apiKey: this.apiKey });
         this.model = client.getGenerativeModel({ model: this.modelId });
       } catch (error) {
         // Локальная подготовка должна работать даже без валидного ключа
         console.warn("Gemini client init skipped:", error.message || error);
       }
-    } else if (this.apiKey && !GoogleGenerativeAI) {
-      console.warn("Install @google/generative-ai to enable Gemini calls.");
+    } else if (this.apiKey && !GoogleGenAI) {
+      console.warn("Install @google/genai to enable Gemini calls.");
     }
 
     // Плоская таблица результатов LLM (создаём при первом запуске, затем мигрируем колонками)

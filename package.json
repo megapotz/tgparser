@@ -8,7 +8,7 @@
     "visualize": "node scripts/visualize.js"
   },
   "dependencies": {
-    "@google/generative-ai": "latest",
+    "@google/genai": "latest",
     "tdl": "latest"
   }
 }
