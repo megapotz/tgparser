@@ -656,44 +656,67 @@ class GeminiHandler {
 }
 
 async function main() {
-  const target = process.argv[2];
-  if (!target) {
-    console.log("No channel specified. Usage: node src/llm-handler.js <channel_username|chat_id>");
+  const args = process.argv.slice(2);
+  const force = args.includes("--force");
+  const allFlag = args.includes("--all");
+  const selectors = args.filter((a) => a && !a.startsWith("--"));
+
+  const handler = new GeminiHandler();
+  const promptText = await fs.readFile(PROMPT_PATH, "utf8");
+  const targets = [];
+
+  if (allFlag || selectors.length === 0) {
+    targets.push(...handler.listEligibleChannels());
+  } else {
+    for (const sel of selectors) {
+      const found = handler.findEligibleChannel(sel);
+      if (found) targets.push(found);
+    }
+  }
+
+  if (targets.length === 0) {
+    console.log("No eligible channels found. Usage: node src/llm-handler.js [--all] [--force] <channel_username|chat_id> ...");
+    handler.close();
     return;
   }
 
-  const handler = new GeminiHandler();
+  await fs.mkdir(TMP_ROOT, { recursive: true });
+  const outDir = await fs.mkdtemp(path.join(TMP_ROOT, "llm-output-"));
+
   try {
-    const channelRow = handler.findEligibleChannel(target);
-    if (!channelRow) {
-      console.error(`Channel not found or missing data in all tables: ${target}`);
-      return;
+    for (const row of targets) {
+      if (!force) {
+        const exists = handler.db
+          .prepare(`SELECT 1 FROM ${LLMPP_TABLE} WHERE chat_id = ? LIMIT 1;`)
+          .get(row.chat_id);
+        if (exists) {
+          console.log(`Skip ${row.chat_id}: already has LLM passport`);
+          continue;
+        }
+      }
+
+      console.log(`LLM for chat_id=${row.chat_id} (${row.active_username || row.title || ""})`);
+      const payload = handler.buildPayload(row.chat_id);
+      const { messages, comments, message_summary, engagement_summary, images, ...channelInfo } = payload;
+
+      const input = {
+        channel_info: { id: row.chat_id, ...channelInfo },
+        messages,
+        message_summary,
+        engagement_summary,
+        comments
+      };
+
+      const { parsed, raw } = await handler.callGemini(promptText, input, images);
+
+      handler.saveResult(row.chat_id, parsed, raw);
+
+      const baseName = sanitizeFilename(row.active_username || row.title || row.chat_id);
+      await fs.writeFile(path.join(outDir, `${baseName}_input.json`), JSON.stringify(input, null, 2), "utf8");
+      await fs.writeFile(path.join(outDir, `${baseName}_output.json`), JSON.stringify(parsed, null, 2), "utf8");
     }
 
-    const payload = handler.buildPayload(channelRow.chat_id);
-    const { messages, comments, message_summary, engagement_summary, images, ...channelInfo } = payload;
-
-    const input = {
-      channel_info: { id: channelRow.chat_id, ...channelInfo },
-      messages,
-      message_summary,
-      engagement_summary,
-      comments
-    };
-    const promptText = await fs.readFile(PROMPT_PATH, "utf8");
-
-    const { parsed, raw } = await handler.callGemini(promptText, input, images);
-
-    // Сохраняем результат в БД
-    handler.saveResult(channelRow.chat_id, parsed, raw);
-
-    await fs.mkdir(TMP_ROOT, { recursive: true });
-    const outDir = await fs.mkdtemp(path.join(TMP_ROOT, "llm-output-"));
-    const baseName = sanitizeFilename(channelRow.active_username || channelRow.title || channelRow.chat_id);
-    await fs.writeFile(path.join(outDir, `${baseName}_input.json`), JSON.stringify(input, null, 2), "utf8");
-    await fs.writeFile(path.join(outDir, `${baseName}_output.json`), JSON.stringify(parsed, null, 2), "utf8");
-
-    console.log(`LLM result saved to ${outDir}`);
+    console.log(`LLM processing done. Outputs saved to ${outDir}`);
   } catch (error) {
     console.error("LLM handler failed:", error.message || error);
     process.exitCode = 1;
