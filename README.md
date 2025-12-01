@@ -1,3 +1,7 @@
+# парсер: codex resume 019ac533-7e3f-7bb2-8889-01cc8147b317
+# codex resume 019acc2b-56aa-7e62-b029-d23652539347
+# ллм
+
 # tgparser
 
 Минимальный скриптовый набор для обновления данных каналов через TDLib с сохранением агрегатов в SQLite.
@@ -8,7 +12,7 @@
    - `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` — свои ключи.
    - `TDLIB_PATH` — путь до `libtdjson.so` (например `/home/mike/td/build/libtdjson.so`).
    - `CHANNEL_LIST_FILE` — список каналов (по умолчанию `src/l.txt`).
-   - `CHANNEL_DB_PATH` — путь к SQLite (по умолчанию `channels.sqlite` в корне).
+   - `CHANNEL_DB_PATH` — путь к SQLite (по умолчанию `channels.filtered.sqlite` в корне).
    - `CHANNEL_MEDIA_DIR` — куда складывать скачанные превью (по умолчанию `media/`).
    - `CHANNEL_REFRESH_ONLY` — перечисление сущностей через запятую, чтобы обновить только их (`searchPublicChat`, `getSupergroupFullInfo`, `getChatHistory`, `comments`, `getChatSimilarChats`).
    - `CHANNEL_REFRESH_SKIP` — перечисление сущностей через запятую, которые нужно пропустить (та же номенклатура).
@@ -24,3 +28,5 @@
 - `refresh_state` отмечает время последнего запроса/успеха/ошибки по сущностям, чтобы не дёргать чаще 30 дней (TTL конфигурируем).
 
 Подробнее — в `src/README.md`.
+
+export GEMINI_API_KEY=AIzaSyAEKOyWcyrN_W0429mQYrkn2lZebjuwIi8 node src/llm-handler.js why4ch

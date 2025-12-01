@@ -29,6 +29,7 @@ const { DB_PATH, MEDIA_ROOT } = require("./config/paths");
 
 const REQUEST_DELAY_MS = Number(process.env.TDLIB_REQUEST_DELAY_MS || 3000);
 const HISTORY_FETCH_LIMIT = Math.max(1, Number(process.env.CHANNEL_HISTORY_FETCH_LIMIT) || 100);
+const HISTORY_MIN_FETCH = Math.max(1, Number(process.env.CHANNEL_HISTORY_MIN_FETCH) || 50);
 const COMMENT_LIMIT_MIN = Number(process.env.CHANNEL_COMMENT_LIMIT_MIN || 100);
 const COMMENT_LIMIT_MAX = Math.max(COMMENT_LIMIT_MIN, Math.min(Number(process.env.CHANNEL_COMMENT_LIMIT_MAX) || 200, 200));
 const COMMENT_TOTAL_TARGET = Number(process.env.CHANNEL_COMMENT_TOTAL_TARGET || COMMENT_LIMIT_MAX); // сколько максимум собираем за раз
@@ -48,11 +49,21 @@ const STALE_SECONDS = STALE_DAYS > 0 ? STALE_DAYS * 24 * 60 * 60 : null;
 const MEDIA_TEXT_THRESHOLD = Number(process.env.CHANNEL_MEDIA_TEXT_THRESHOLD || 100);
 const SPEECH_WAIT_TIMEOUT_MS = Number(process.env.SPEECH_WAIT_TIMEOUT_MS || 20000);
 const REACTIONS_LOG_PATH = process.env.CHANNEL_REACTIONS_LOG || path.join(process.cwd(), "reactions.log");
+const CHANNEL_FAIL_LIST_FILE = process.env.CHANNEL_FAIL_LIST_FILE || path.join(path.dirname(CHANNEL_LIST_FILE), "l.fail.txt");
 
 const updatesByChannel = new Map();
 let currentChannel = null;
 const pendingTranscriptions = new Map();
 let rknUsernames = new Set();
+
+function parseChannelInput(raw) {
+  const num = Number(raw);
+  if (Number.isFinite(num)) {
+    return { kind: "chat_id", chatId: num };
+  }
+  const username = String(raw || "").trim().replace(/^@+/, "");
+  return { kind: "username", username };
+}
 
 function logInfo(message, ...args) {
   console.log(`[refresh] ${message}`, ...args);
@@ -77,6 +88,11 @@ function boolToInt(value) {
 function normalizeUsername(name) {
   if (!name || typeof name !== "string") return null;
   return name.trim().toLowerCase();
+}
+
+function normalizeRawChannel(name) {
+  if (!name || typeof name !== "string") return null;
+  return name.trim();
 }
 
 function isRknByChat(chat) {
@@ -274,6 +290,9 @@ function initDb(dbPath) {
   const getRefresh = db.prepare(`SELECT * FROM refresh_state WHERE chat_id = ? AND entity = ? LIMIT 1;`);
   const getChannel = db.prepare(`SELECT * FROM channels WHERE chat_id = ? LIMIT 1;`);
   const getChannelByUsername = db.prepare(`SELECT * FROM channels WHERE active_username = ? LIMIT 1;`);
+  const getMessageCount = db.prepare(
+    "SELECT json_array_length(json_extract(messages_json, '$.messages')) AS cnt FROM channel_messages WHERE chat_id = ?"
+  );
 
   ensureColumn("channels", "reactions_disabled", "INTEGER");
   ensureColumn("channels", "active_username", "TEXT");
@@ -288,7 +307,8 @@ function initDb(dbPath) {
     upsertRefresh,
     getRefresh,
     getChannel,
-    getChannelByUsername
+    getChannelByUsername,
+    getMessageCount
   };
 }
 
@@ -673,6 +693,12 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function isUsernameGoneError(error) {
+  if (!error) return false;
+  const msg = String(error.message || error || "").toUpperCase();
+  return msg.includes("USERNAME_INVALID") || msg.includes("USERNAME_NOT_OCCUPIED");
+}
+
 function isFloodError(error) {
   if (!error) return false;
   if (Number(error.code) === 429) return true;
@@ -689,9 +715,9 @@ function abortOnFlood(error) {
 }
 
 function isStale(getRefresh, chatId, entity) {
-  if (FORCE_REFRESH) return true;
   if (ONLY_ENTITIES.length > 0 && !ONLY_ENTITIES.includes(entity)) return false;
   if (SKIP_ENTITIES.length > 0 && SKIP_ENTITIES.includes(entity)) return false;
+  if (FORCE_REFRESH) return true;
   const row = getRefresh.get(chatId, entity);
   if (!row || !row.last_success_at) return true;
   if (STALE_SECONDS === null) return false; // таймер отключён, данных достаточно
@@ -699,6 +725,20 @@ function isStale(getRefresh, chatId, entity) {
   if (!Number.isFinite(last)) return true;
   const ageMs = Date.now() - last;
   return ageMs > STALE_SECONDS * 1000;
+}
+
+function missingSupergroupFields(channelRow) {
+  if (!channelRow) return true;
+  return ["member_count", "boost_level", "has_direct_messages_group", "has_linked_chat"].some(
+    (key) => channelRow[key] === null || typeof channelRow[key] === "undefined"
+  );
+}
+
+function missingFullInfoFields(channelRow) {
+  if (!channelRow) return true;
+  return ["description", "linked_chat_id", "member_count", "photo_big_id"].some(
+    (key) => channelRow[key] === null || typeof channelRow[key] === "undefined"
+  );
 }
 
 function allEntitiesFresh(getRefresh, chatId) {
@@ -732,11 +772,13 @@ async function fetchMessages({ callTd, callTdFast, chatId, limit }) {
   let fromMessageId = 0;
   let totalRaw = 0;
 
-  while (totalRaw < limit) {
+  const target = Math.max(limit, HISTORY_MIN_FETCH);
+
+  while (totalRaw < target) {
     if (REQUEST_DELAY_MS > 0 && batchStats.length > 0) {
       await delay(REQUEST_DELAY_MS);
     }
-    const remaining = limit - totalRaw;
+    const remaining = target - totalRaw;
     const batchLimit = Math.min(remaining, 100);
     const batch = await callTd({
       method: "getChatHistory",
@@ -769,9 +811,6 @@ async function fetchMessages({ callTd, callTdFast, chatId, limit }) {
     }
 
     totalRaw += batchMessages.length;
-    if (batchMessages.length < batchLimit) {
-      break; // данных меньше, дальше не спрашиваем
-    }
 
     const last = batchMessages[batchMessages.length - 1];
     const nextFrom = typeof last?.id === "number" ? last.id : 0;
@@ -993,6 +1032,43 @@ function cancelPendingTranscription(chatId, messageId) {
   pending.resolve(null);
 }
 
+async function readLines(filePath) {
+  try {
+    const raw = await fs.readFile(filePath, "utf8");
+    return raw
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+  } catch (error) {
+    return [];
+  }
+}
+
+async function writeLines(filePath, lines) {
+  const payload = lines.join("\n") + (lines.length ? "\n" : "");
+  await fs.writeFile(filePath, payload, "utf8");
+}
+
+async function moveChannelToFailList(channelName) {
+  const raw = normalizeRawChannel(channelName);
+  const norm = normalizeUsername(channelName);
+  if (!raw || !norm) return;
+
+  const list = await readLines(CHANNEL_LIST_FILE);
+  const nextList = list.filter((item) => normalizeUsername(item) !== norm);
+  if (nextList.length !== list.length) {
+    await writeLines(CHANNEL_LIST_FILE, nextList);
+  }
+
+  const failList = await readLines(CHANNEL_FAIL_LIST_FILE);
+  if (!failList.some((item) => normalizeUsername(item) === norm)) {
+    failList.push(raw);
+    await writeLines(CHANNEL_FAIL_LIST_FILE, failList);
+  }
+
+  logInfo(`Перенёс ${raw} в l.fail.txt`);
+}
+
 function waitForTranscription(chatId, messageId) {
   const key = transcriptionKey(chatId, messageId);
   return new Promise((resolve) => {
@@ -1081,7 +1157,8 @@ async function main() {
     upsertRefresh,
     getRefresh,
     getChannel,
-    getChannelByUsername
+    getChannelByUsername,
+    getMessageCount
   } = initDb(DB_PATH);
 
   try {
@@ -1104,6 +1181,8 @@ async function main() {
       currentChannel = channelName;
       logInfo(`Начинаю ${channelName}`);
 
+      const parsedTarget = parseChannelInput(channelName);
+
       const existing = getChannelByUsername.get(channelName);
       const existingChatId = existing?.chat_id;
       if (!FORCE_REFRESH && STALE_SECONDS === null && allEntitiesFresh(getRefresh, existingChatId)) {
@@ -1113,37 +1192,75 @@ async function main() {
         continue;
       }
 
+      if (!FORCE_REFRESH && STALE_SECONDS === null && existingChatId) {
+        const countRow = getMessageCount.get(existingChatId);
+        const messageCount = Number(countRow?.cnt) || 0;
+        if (messageCount > 1) {
+          logInfo(`Пропускаю ${channelName}: история уже есть (${messageCount} сообщений)`);
+          updatesByChannel.set(channelName, []);
+          currentChannel = null;
+          continue;
+        }
+      }
+
       try {
         const isRknFlag = true; // все из списка l.txt считаем is_rkn=true
-
-        // searchPublicChat — делаем всегда, чтобы получить chat_id и свежие данные
-        const chat = await callTdWithDelay(callTd, {
-          method: "searchPublicChat",
-          params: { username: channelName },
-          responses: []
-        });
-        if (!chat || !chat.id) {
-          throw new Error("Чат не найден");
-        }
-        applyChatToChannel(upsertChannel, chat, isRknFlag);
-        try {
-          const chatDetails = await callTdWithDelay(callTd, {
+        let chat = null;
+        if (parsedTarget.kind === "chat_id") {
+          // numeric chat_id: сразу getChat
+          chat = await callTdWithDelay(callTd, {
             method: "getChat",
-            params: { chat_id: chat.id },
+            params: { chat_id: parsedTarget.chatId },
             responses: []
           });
-          applyChatToChannel(upsertChannel, chatDetails, isRknFlag);
-          logInfo(`getChat ok: chat_id=${chat.id}`);
-        } catch (_) {
-          // ignore, searchPublicChat data already applied
+          if (!chat || !chat.id) {
+            throw new Error("Чат не найден по chat_id");
+          }
+          applyChatToChannel(upsertChannel, chat, isRknFlag);
+          touchRefresh(upsertRefresh, chat.id, "searchPublicChat", "success");
+          logInfo(`getChat via id ok: chat_id=${chat.id}, title=${chat.title || ""}`);
+        } else {
+          if (!isStale(getRefresh, existingChatId, "searchPublicChat") && existingChatId) {
+            chat = {
+              id: existingChatId,
+              title: existing?.title || null,
+              type: existing?.supergroup_id
+                ? { _: "chatTypeSupergroup", supergroup_id: existing.supergroup_id }
+                : null
+            };
+            logInfo(`searchPublicChat skip: chat_id=${existingChatId}`);
+          } else {
+            chat = await callTdWithDelay(callTd, {
+              method: "searchPublicChat",
+              params: { username: parsedTarget.username },
+              responses: []
+            });
+            if (!chat || !chat.id) {
+              throw new Error("Чат не найден");
+            }
+            applyChatToChannel(upsertChannel, chat, isRknFlag);
+            try {
+              const chatDetails = await callTdWithDelay(callTd, {
+                method: "getChat",
+                params: { chat_id: chat.id },
+                responses: []
+              });
+              applyChatToChannel(upsertChannel, chatDetails, isRknFlag);
+              logInfo(`getChat ok: chat_id=${chat.id}`);
+            } catch (_) {
+              // ignore, searchPublicChat data already applied
+            }
+            touchRefresh(upsertRefresh, chat.id, "searchPublicChat", "success");
+            logInfo(`searchPublicChat ok: chat_id=${chat.id}, title=${chat.title || ""}`);
+          }
         }
-        touchRefresh(upsertRefresh, chat.id, "searchPublicChat", "success");
-        logInfo(`searchPublicChat ok: chat_id=${chat.id}, title=${chat.title || ""}`);
 
         let supergroupId = null;
         if (isSupergroup(chat)) {
           supergroupId = chat.type.supergroup_id;
-          if (isStale(getRefresh, chat.id, "getSupergroup")) {
+          const channelRow = getChannel.get(chat.id);
+          const needsSupergroup = isStale(getRefresh, chat.id, "getSupergroup") || missingSupergroupFields(channelRow);
+          if (needsSupergroup) {
             try {
               const supergroup = await callTdWithDelay(callTd, {
                 method: "getSupergroup",
@@ -1159,7 +1276,8 @@ async function main() {
               logInfo(`getSupergroup error: ${sgErr.message || sgErr}`);
             }
           }
-          if (isStale(getRefresh, chat.id, "getSupergroupFullInfo")) {
+          const needsFullInfo = isStale(getRefresh, chat.id, "getSupergroupFullInfo") || missingFullInfoFields(channelRow);
+          if (needsFullInfo) {
             try {
               const fullInfo = await callTdWithDelay(callTd, {
                 method: "getSupergroupFullInfo",
@@ -1345,6 +1463,9 @@ async function main() {
           applyUpdate(upsertChannel, update, chat?.id, supergroupId);
         }
       } catch (error) {
+        if (parsedTarget.kind === "username" && isUsernameGoneError(error)) {
+          await moveChannelToFailList(channelName);
+        }
         abortOnFlood(error);
         logInfo(`Ошибка по ${channelName}: ${error.message || error}`);
       } finally {

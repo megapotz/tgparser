@@ -11,9 +11,13 @@ try {
 }
 const { DB_PATH } = require("./config/paths");
 
+const LLM_IMAGE_INLINE_LIMIT = Math.max(0, Number(process.env.LLM_IMAGE_INLINE_LIMIT) || 25);
+const LLM_IMAGE_MAX_BYTES = Math.max(0, Number(process.env.LLM_IMAGE_MAX_BYTES) || 2 * 1024 * 1024);
+
 const DEFAULT_MODEL_ID = process.env.GEMINI_MODEL_ID || "gemini-2.5-pro";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || null;
 const TMP_ROOT = path.join(process.cwd(), "tmp");
+const PROMPT_PATH = path.join(__dirname, "prompts", "blogger-passport.md");
 
 const CHANNEL_FIELDS = new Set([
   "active_username",
@@ -77,6 +81,70 @@ function sanitizeFilename(base) {
     .replace(/_{2,}/g, "_")
     .replace(/^_+|_+$/g, "")
     .slice(0, 120) || "channel";
+}
+
+function mimeFromPath(filePath) {
+  const ext = (path.extname(filePath || "").toLowerCase() || "").replace(/^\./, "");
+  switch (ext) {
+    case "jpg":
+    case "jpeg":
+      return "image/jpeg";
+    case "png":
+      return "image/png";
+    case "gif":
+      return "image/gif";
+    case "webp":
+      return "image/webp";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+async function buildInlineImages(imagePaths) {
+  if (!Array.isArray(imagePaths) || imagePaths.length === 0 || LLM_IMAGE_INLINE_LIMIT === 0) return [];
+  const parts = [];
+  for (const p of imagePaths.slice(0, LLM_IMAGE_INLINE_LIMIT)) {
+    try {
+      const stat = await fs.stat(p);
+      if (!stat.isFile() || (LLM_IMAGE_MAX_BYTES > 0 && stat.size > LLM_IMAGE_MAX_BYTES)) {
+        continue;
+      }
+      const buf = await fs.readFile(p);
+      parts.push({ inlineData: { data: buf.toString("base64"), mimeType: mimeFromPath(p) }, _src: p });
+    } catch (_) {
+      // skip unreadable files
+    }
+  }
+  return parts;
+}
+
+function sum(list) {
+  return Array.isArray(list) ? list.reduce((acc, value) => acc + value, 0) : 0;
+}
+
+function average(list) {
+  if (!Array.isArray(list) || list.length === 0) return null;
+  return sum(list) / list.length;
+}
+
+function stddev(list) {
+  if (!Array.isArray(list) || list.length === 0) return null;
+  const mean = average(list);
+  if (!Number.isFinite(mean) || mean === 0) return null;
+  const variance = list.reduce((acc, value) => acc + (value - mean) ** 2, 0) / list.length;
+  return Math.sqrt(variance);
+}
+
+function percentile(sortedAsc, p) {
+  if (!Array.isArray(sortedAsc) || sortedAsc.length === 0) return null;
+  if (p <= 0) return sortedAsc[0];
+  if (p >= 100) return sortedAsc[sortedAsc.length - 1];
+  const rank = (p / 100) * (sortedAsc.length - 1);
+  const low = Math.floor(rank);
+  const high = Math.ceil(rank);
+  if (low === high) return sortedAsc[low];
+  const weight = rank - low;
+  return sortedAsc[low] * (1 - weight) + sortedAsc[high] * weight;
 }
 
 class GeminiHandler {
@@ -149,10 +217,6 @@ class GeminiHandler {
         base.image_urls = urls;
       }
 
-      if (typeof msg.text_markdown === "string" && /erid/i.test(msg.text_markdown)) {
-        base.is_ad = true;
-      }
-
       return base;
     });
   }
@@ -172,12 +236,9 @@ class GeminiHandler {
 
   buildMessageSummary(messages) {
     const total = Array.isArray(messages) ? messages.length : 0;
-    const hasErid = Array.isArray(messages)
-      ? messages.filter((m) => typeof m.text_markdown === "string" && /erid/i.test(m.text_markdown)).length
-      : 0;
 
     if (!Array.isArray(messages) || messages.length === 0) {
-      return { total, has_erid: hasErid, avg_posts_30d: null };
+      return { total, avg_posts_30d: null };
     }
 
     const msInDay = 24 * 60 * 60 * 1000;
@@ -186,7 +247,7 @@ class GeminiHandler {
       .filter((ts) => Number.isFinite(ts));
 
     if (timestamps.length === 0) {
-      return { total, has_erid: hasErid, avg_posts_30d: null };
+      return { total, avg_posts_30d: null };
     }
 
     const oldest = Math.min(...timestamps);
@@ -195,7 +256,119 @@ class GeminiHandler {
     const ratePerMs = timestamps.length / spanMs;
     const avg30 = Math.round(ratePerMs * 30 * msInDay);
 
-    return { total, has_erid: hasErid, avg_posts_30d: avg30 };
+    return { total, avg_posts_30d: avg30 };
+  }
+
+  buildEngagementStats(messages) {
+    const list = Array.isArray(messages) ? messages : [];
+    const sampleSize = list.length;
+
+    const views = [];
+    const orderedViews = [];
+    const reactionsList = [];
+    const repliesList = [];
+    const forwardsList = [];
+    const engagements = [];
+
+    for (const msg of list) {
+      const viewsVal = Number(msg?.view_count);
+      if (Number.isFinite(viewsVal)) {
+        views.push(viewsVal);
+        orderedViews.push(viewsVal);
+      }
+
+      const reactionsVal = Number.isFinite(Number(msg?.reactions?.total)) ? Number(msg.reactions.total) : 0;
+      const repliesVal = Number.isFinite(Number(msg?.reply_count)) ? Number(msg.reply_count) : 0;
+      const forwardsVal = Number.isFinite(Number(msg?.forward_count)) ? Number(msg.forward_count) : 0;
+
+      reactionsList.push(reactionsVal);
+      repliesList.push(repliesVal);
+      forwardsList.push(forwardsVal);
+      engagements.push(reactionsVal + repliesVal + forwardsVal);
+    }
+
+    const sortedViews = views.slice().sort((a, b) => a - b);
+    const p50Views = percentile(sortedViews, 50);
+    const p95Views = percentile(sortedViews, 95);
+    const maxViews = sortedViews.length > 0 ? sortedViews[sortedViews.length - 1] : null;
+
+    const totalViews = sum(views);
+    const totalEngagement = sum(engagements);
+    const totalReactions = sum(reactionsList);
+    const totalReplies = sum(repliesList);
+    const totalForwards = sum(forwardsList);
+
+    const engagementPerView = [];
+    for (let i = 0; i < list.length; i += 1) {
+      const viewsVal = Number(list[i]?.view_count);
+      const engVal = engagements[i] || 0;
+      if (Number.isFinite(viewsVal) && viewsVal > 0) {
+        engagementPerView.push(engVal / viewsVal);
+      }
+    }
+
+    const erTotal = totalViews > 0 ? totalEngagement / totalViews : null;
+    const erAvg = engagementPerView.length > 0 ? average(engagementPerView) : null;
+    const reactionRate = totalViews > 0 ? totalReactions / totalViews : null;
+    const replyRate = totalViews > 0 ? totalReplies / totalViews : null;
+    const forwardRate = totalViews > 0 ? totalForwards / totalViews : null;
+
+    const spikeRatioViews = Number.isFinite(p50Views) && p50Views > 0 && Number.isFinite(p95Views)
+      ? p95Views / p50Views
+      : null;
+    const maxOverP95Views = Number.isFinite(p95Views) && p95Views > 0 && Number.isFinite(maxViews)
+      ? maxViews / p95Views
+      : null;
+
+    const recentViews = orderedViews.slice(0, 30);
+    let flatnessLast30Views = null;
+    if (recentViews.length > 0) {
+      const meanRecent = average(recentViews);
+      const stdRecent = stddev(recentViews);
+      if (Number.isFinite(meanRecent) && meanRecent > 0 && Number.isFinite(stdRecent)) {
+        flatnessLast30Views = stdRecent / meanRecent;
+      }
+    }
+
+    let flatBandShareViews = null;
+    if (Number.isFinite(p50Views) && p50Views > 0) {
+      const lower = p50Views * 0.95;
+      const upper = p50Views * 1.05;
+      const inBand = views.filter((v) => v >= lower && v <= upper).length;
+      flatBandShareViews = views.length > 0 ? inBand / views.length : null;
+    }
+
+    const hasSpikes = spikeRatioViews !== null ? spikeRatioViews > 1.4 : null;
+    const possibleSmoothing =
+      flatnessLast30Views !== null && flatBandShareViews !== null
+        ? flatnessLast30Views < 0.05 && flatBandShareViews > 0.7
+        : null;
+
+    return {
+      sample_size: sampleSize,
+      avg_views: average(views),
+      median_views: p50Views,
+      p95_views: p95Views,
+      max_views: maxViews,
+      avg_engagement: average(engagements),
+      er_total: erTotal,
+      er_avg: erAvg,
+      reaction_rate: reactionRate,
+      reply_rate: replyRate,
+      forward_rate: forwardRate,
+      spike_ratio_views: spikeRatioViews,
+      max_over_p95_views: maxOverP95Views,
+      flatness_last30_views: flatnessLast30Views,
+      flat_band_share_views: flatBandShareViews,
+      has_spikes: hasSpikes,
+      possible_smoothing: possibleSmoothing,
+      data_sparse: sampleSize < 10
+    };
+  }
+
+  buildEngagementSummary(messages) {
+    const list = Array.isArray(messages) ? messages : [];
+    return [{ scope: "all", ...this.buildEngagementStats(list) }];
   }
 
   close() {
@@ -227,25 +400,37 @@ class GeminiHandler {
 
     const messages = this.adaptMessages(messagesJson);
     const comments = this.adaptComments(commentsJson);
+    const imagePaths = Array.from(
+      new Set(
+        (Array.isArray(messages) ? messages : [])
+          .map((m) => m?.media_local_path)
+          .filter((p) => typeof p === "string" && p.trim())
+      )
+    );
 
     return {
       ...channel,
       messages,
       message_summary: this.buildMessageSummary(messages),
-      comments
+      engagement_summary: this.buildEngagementSummary(messages),
+      comments,
+      images: imagePaths
     };
   }
 
-  async callGemini(promptText, inputObject) {
+  async callGemini(promptText, inputObject, imagePaths = []) {
     if (!this.model) {
       throw new Error("Gemini model is not initialized; install @google/generative-ai and set GEMINI_API_KEY");
     }
 
     const payloadString = JSON.stringify(inputObject, null, 2);
-    const response = await this.model.generateContent([
-      { text: promptText },
-      { text: `\nINPUT JSON:\n${payloadString}` }
-    ]);
+    const parts = [{ text: promptText }, { text: `\nINPUT JSON:\n${payloadString}` }];
+    const inlineImages = await buildInlineImages(imagePaths);
+    for (const img of inlineImages) {
+      parts.push({ inlineData: img.inlineData });
+    }
+
+    const response = await this.model.generateContent(parts);
 
     const text = response?.response?.text?.() || response?.response?.candidates?.[0]?.content?.parts?.[0]?.text || "";
     const match = text.match(/\{[\s\S]*\}/);
@@ -295,80 +480,18 @@ async function main() {
     }
 
     const payload = handler.buildPayload(channelRow.chat_id);
-    const { messages, comments, message_summary, ...channelInfo } = payload;
-    const ads = Array.isArray(messages) ? messages.filter((m) => m.is_ad) : [];
+    const { messages, comments, message_summary, engagement_summary, images, ...channelInfo } = payload;
 
     const input = {
       channel_info: { id: channelRow.chat_id, ...channelInfo },
       messages,
-      ads,
       message_summary,
+      engagement_summary,
       comments
     };
+    const promptText = await fs.readFile(PROMPT_PATH, "utf8");
 
-    const promptText = `Вы — экспертный маркетинг-аналитик, специализирующийся на социальных медиа и influencer-маркетинге. Ваша задача — проанализировать предоставленные данные из ленты блогера (список постов с текстом, изображениями, метриками) и сгенерировать подробный "паспорт блогера" в строго определенном JSON-формате.
-
-Ваш анализ должен быть глубоким, учитывая не только прямой текст, но и подтекст, тональность, смысл изображений, а также количественные и качественные показатели вовлеченности аудитории.
-
-**Входные данные:**
-JSON-объект, содержащий \`channel_info\` и массив \`messages\` с последними публикациями, включая текст, медиа, просмотры, реакции, комментарии и пересылки, а также массив \`ads\`, в котором собраны рекламные публикации блогера за последнее время.
-
-**Задача:**
-На основе входных данных сгенерируйте JSON-объект, который строго соответствует следующей структуре и правилам.
-
-### **ПРАВИЛА И СТРУКТУРА ВЫХОДНОГО JSON**
-
-**1. \`blogger_id\` (string):**
-   - Скопируйте \`id\` из \`channel_info\`.
-
-**2. \`content_summary\` (object):**
-   - \`short_description\` (string): Краткое, но емкое описание канала в 2-3 предложениях. О чем этот канал и для кого он?
-   - \`content_type\` (enum string): Определите основной тип контента. Допустимые значения: \`personal_brand\`, \`news\`, \`entertainment\`, \`niche\`. *Если ни одна категория не подходит, предложите наиболее релевантное кастомное значение.*
- - “has_personal_content”: есть личное присутствие с фото и видео (либо это обезличенный паблик, в котором автор анонимен)
-   - \`tags\` (array of strings): Список тегов, которые описывают о чем этот канал в целом. Не привязывайся к содержанию отдельных постов, нужно выхватить общую суть и описать ее.
-   - \`language\` (string): Язык, на котором ведется канал.
-   - \`contacts\` (string): из поля description нужно вынуть контакты. Если контактов в описании нет, установи значение поля в null.
-   - \`category\` (object):
-     - \`primary\` (array of strings): Выберите 1-2 максимально подходящие категории из списка ниже (канал можно привести как канонический пример).
-     - \`secondary\` (array of strings): Если есть категории, к которым канал точно относится, но когда думаешь про эту категорию, то на ум приходят несколько другой контент, то добавляем их в secondary
-
-     Список категорий: Авто и мото, Бизнес и стартапы, Видеоигры и киберспорт, Для взрослых (18+), Духовные практики и эзотерика, Еда и кулинария, Животные и природа, Здоровье, медицина и фитнес, Инвестиции и трейдинг, Иностранные языки, Искусство и дизайн, История, Карьера и работа, Кино и сериалы, Книги, аудиокниги и подкасты, Криптовалюты, Культура и события, Лайфстайл и блоги, Маркетинг и PR, Мода и стиль, Музыка, Наука и технологии, Недвижимость, Новости и СМИ, Образование и познавательное, Политика и общество, Право и юриспруденция, Психология и саморазвитие, Путешествия и туризм, Ставки и гемблинг, Строительство, ремонт и интерьер, Теневой интернет и Digital-андерграунд, Товары, скидки и акции, Экономика и финансы, Юмор и развлечения.
-
-**3. \`audience_profile\` (object):**
-   - \`geo\` (object): Определяй географию на основе языка канала, упоминаемых в постах локаций, обсуждаемых событий и культурного контекста.
-     - \`primary\` (string): Основной географический регион (страна или город).
-     - \`secondary\` (array of strings): Второстепенные регионы (если применимо).
-   - \`gender_age_distribution\` (object): Оцените распределение аудитории по полу и возрасту. Ключи — строка в формате \`[F/M][возрастной_диапазон]\`, значение — доля от 0.0 до 1.0. Сумма всех долей должна быть равна 1.0. Используйте диапазоны: \`12-17\`, \`18-24\`, \`25-34\`, \`35-44\`, \`45-54\`, \`55+\`.
-
-**4. \`advertising_potential\` (object):**
-   - \`brand_safety_risk\` (enum string): Оцените риск для бренда при размещении рекламы (\`green\`, \`yellow\`, \`red\`).
-   - \`tone_of_voice\` (array of strings): Опишите тональность автора/канала (например, "экспертный", "юмористический", "саркастичный", "новостной", "мотивирующий", "личный и доверительный").
-   - \`community_type\` (enum string): Если есть комментарии к постам, оцените тип взаимодействия внутри сообщества (\`strong_fan_community\`, \`passive_audience\`, \`professional_network\`, \`toxic_community\`). Иначе оставь поле null.
-   - \`organic_activity_score\` (enum string): Оцени вовлеченность как \`high\`, \`medium\` или \`low\`. Для оценки анализируй соотношение \`views\`, \`reactions\`, \`comments\` и \`forwards\`. \`high\` — стабильная и пропорциональная активность. \`low\` — низкая активность или явные диспропорции (например, много просмотров, но почти нет реакций/комментариев).
-   - \`score_explanation\` (string): Обоснуй свою оценку. Укажи примерный ER (отношение суммы реакций и комментариев к просмотрам), сравни активность на разных типах постов (новостных, дискуссионных, рекламных) и сделай вывод об органичности.
-   - \`monetization_model\` (array of enum strings): Проанализируй существующие рекламные посты (если есть), блог в целом и сделай вывод какой какой рекламный продукт лучше всего подойдет блогеру:
-
-cpc - самый низкий CPM, подходит новостникам, тематическим пабликам без сильного бренда. Это каналы с невысоким качеством контента или небольшой и не слишком вовлеченной аудиторией, где с “драной овцы хоть шерсти клок”. У них, как правило, нет или очень мало прямых рекламодателей, и они не могут уверенно стоять на ногах.
-
-cpv - более качественные, "экспертные" каналы, которые не готовы работать за низкий CPM модели CPC. Ключевой барьер: Отсутствие контроля. Как и в CPC, реклама приходит "как есть", без предварительного согласования и возможности редактирования. Это отталкивает многие каналы, которые тщательно следят за своим контентом.
-
-cpp - Топовые и экспертные каналы, ценящие полный контроль
-(Личные блоги экспертов, каналы с высокой репутацией, например, условный "Код Дурова")
-Продукт: CPP (Cost Per Post)
-Описание сегмента: Это премиум-сегмент. Каналы, которые дорожат своей репутацией, пишут посты сами или тесно согласовывают их с рекламодателем. Для них критически важен контроль над контентом.
-Почему выбирают этот продукт:
-Полный контроль над процессом: Владелец канала видит рекламный пост до публикации.
-Возможность редактирования: Можно согласовать и внести правки в текст поста.
-Свои условия: Можно установить любую фиксированную цену за пост.
-Характерный признак - прямые интеграции других рекламодетелей
-
-cpa (Скидочники, купонники, каналы с подборками товаров)
-Продукты: CPA (Cost Per Action) и Ритм
-Описание сегмента: Это узкая, но специфическая ниша каналов, чей основной бизнес — генерация целевых действий (покупок, регистраций, установок). Их аудитория готова переходить по ссылкам и совершать действия.
-
-   - \`communication_strategy_tips\` (string): Дайте краткий, но действенный совет менеджеру по работе с блогерами. Обязательно подсвети в общих чертах какая реклама уже выходила.`;
-
-    const { parsed } = await handler.callGemini(promptText, input);
+    const { parsed } = await handler.callGemini(promptText, input, images);
 
     await fs.mkdir(TMP_ROOT, { recursive: true });
     const outDir = await fs.mkdtemp(path.join(TMP_ROOT, "llm-output-"));

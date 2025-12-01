@@ -1,7 +1,8 @@
 node_modules/
-tdlib/
+tdlib*/
 media/
 tmp/
 channels.sqlite*
+channels.filtered.sqlite*
 .env
 *.log
