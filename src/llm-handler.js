@@ -10,6 +10,8 @@ try {
   // Библиотека подтянется после установки зависимостей
 }
 const { DB_PATH } = require("./config/paths");
+const LLMPP_TABLE = "llm_passports";
+const LLMPP_SCHEMA_VERSION = 1;
 
 const LLM_IMAGE_INLINE_LIMIT = Math.max(0, Number(process.env.LLM_IMAGE_INLINE_LIMIT) || 25);
 const LLM_IMAGE_MAX_BYTES = Math.max(0, Number(process.env.LLM_IMAGE_MAX_BYTES) || 2 * 1024 * 1024);
@@ -147,6 +149,14 @@ function percentile(sortedAsc, p) {
   return sortedAsc[low] * (1 - weight) + sortedAsc[high] * weight;
 }
 
+function ensureColumn(db, table, column, definition) {
+  const existing = db.prepare(`PRAGMA table_info(${table});`).all();
+  const has = existing.some((row) => row.name === column);
+  if (!has) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`);
+  }
+}
+
 class GeminiHandler {
   constructor({ dbPath = DB_PATH, modelId = DEFAULT_MODEL_ID, apiKey = GEMINI_API_KEY } = {}) {
     this.db = new DatabaseSync(dbPath);
@@ -166,6 +176,42 @@ class GeminiHandler {
       console.warn("Install @google/generative-ai to enable Gemini calls.");
     }
 
+    // Плоская таблица результатов LLM (создаём при первом запуске, затем мигрируем колонками)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS ${LLMPP_TABLE} (
+        chat_id INTEGER PRIMARY KEY,
+        schema_version INTEGER DEFAULT ${LLMPP_SCHEMA_VERSION},
+        raw_json TEXT,
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now'))
+      );
+    `);
+
+    const columns = [
+      ["blogger_id", "TEXT"],
+      ["content_short_description", "TEXT"],
+      ["content_channel_format", "TEXT"],
+      ["content_tags", "TEXT"],
+      ["content_language", "TEXT"],
+      ["content_contacts", "TEXT"],
+      ["content_category", "TEXT"],
+      ["ads", "TEXT"],
+      ["audience_geo", "TEXT"],
+      ["audience_gender_age", "TEXT"],
+      ["community_psychotype", "TEXT"],
+      ["community_content_risks", "TEXT"],
+      ["advertising_brand_safety", "TEXT"],
+      ["advertising_tone_of_voice", "TEXT"],
+      ["advertising_monetization_model", "TEXT"],
+      ["advertising_ad_report", "TEXT"],
+      ["advertising_communication_strategy_tips", "TEXT"],
+      ["advertising_stats_comment", "TEXT"],
+      ["schema_version", "INTEGER"]
+    ];
+    for (const [col, def] of columns) {
+      ensureColumn(this.db, LLMPP_TABLE, col, def);
+    }
+
     this.statements = {
       eligible: this.db.prepare(`
         SELECT c.chat_id, c.title, c.active_username
@@ -179,6 +225,46 @@ class GeminiHandler {
       comments: this.db.prepare("SELECT payload_json FROM channel_comments WHERE chat_id = ? LIMIT 1"),
       refreshState: this.db.prepare("SELECT * FROM refresh_state WHERE chat_id = ?")
     };
+
+    this.statements.upsertResult = this.db.prepare(`
+      INSERT INTO ${LLMPP_TABLE} (
+        chat_id, blogger_id,
+        content_short_description, content_channel_format, content_tags, content_language, content_contacts, content_category,
+        ads,
+        audience_geo, audience_gender_age, community_psychotype, community_content_risks,
+        advertising_brand_safety, advertising_tone_of_voice, advertising_monetization_model, advertising_ad_report, advertising_communication_strategy_tips, advertising_stats_comment,
+        raw_json, created_at, updated_at
+      )
+      VALUES (
+        @chat_id, @blogger_id,
+        @content_short_description, @content_channel_format, @content_tags, @content_language, @content_contacts, @content_category,
+        @ads,
+        @audience_geo, @audience_gender_age, @community_psychotype, @community_content_risks,
+        @advertising_brand_safety, @advertising_tone_of_voice, @advertising_monetization_model, @advertising_ad_report, @advertising_communication_strategy_tips, @advertising_stats_comment,
+        @raw_json, datetime('now'), datetime('now')
+      )
+      ON CONFLICT(chat_id) DO UPDATE SET
+        blogger_id=excluded.blogger_id,
+        content_short_description=excluded.content_short_description,
+        content_channel_format=excluded.content_channel_format,
+        content_tags=excluded.content_tags,
+        content_language=excluded.content_language,
+        content_contacts=excluded.content_contacts,
+        content_category=excluded.content_category,
+        ads=excluded.ads,
+        audience_geo=excluded.audience_geo,
+        audience_gender_age=excluded.audience_gender_age,
+        community_psychotype=excluded.community_psychotype,
+        community_content_risks=excluded.community_content_risks,
+        advertising_brand_safety=excluded.advertising_brand_safety,
+        advertising_tone_of_voice=excluded.advertising_tone_of_voice,
+        advertising_monetization_model=excluded.advertising_monetization_model,
+        advertising_ad_report=excluded.advertising_ad_report,
+        advertising_communication_strategy_tips=excluded.advertising_communication_strategy_tips,
+        advertising_stats_comment=excluded.advertising_stats_comment,
+        raw_json=excluded.raw_json,
+        updated_at=datetime('now');
+    `);
   }
 
   adaptChannel(raw) {
@@ -445,6 +531,59 @@ class GeminiHandler {
     return { parsed, raw: text };
   }
 
+  saveResult(chatId, parsed, raw) {
+    if (!parsed || typeof parsed !== "object") return;
+
+    // Если парсинг не удался и модель вернула _raw, попробуем ещё раз распарсить.
+    if (parsed._raw && typeof parsed._raw === "string") {
+      try {
+        const reParsed = JSON.parse(parsed._raw);
+        parsed = reParsed;
+      } catch (_) {
+        // оставляем как есть
+      }
+    }
+
+    const cs = parsed.content_summary || {};
+    const ap = parsed.audience_profile || {};
+    const comm = ap.community || {};
+    const adv = parsed.advertising_potential || {};
+    const adsField = typeof parsed.ads !== "undefined" ? parsed.ads : cs.ads;
+
+    const safeJson = (val) => {
+      if (val === null || typeof val === "undefined") return null;
+      try {
+        return JSON.stringify(val);
+      } catch (_) {
+        return null;
+      }
+    };
+
+    const payload = {
+      chat_id: chatId,
+      blogger_id: parsed.blogger_id || null,
+      content_short_description: cs.short_description || null,
+      content_channel_format: cs.channel_format || null,
+      content_tags: safeJson(cs.tags),
+      content_language: cs.language || null,
+      content_contacts: cs.contacts || null,
+      content_category: safeJson(cs.category),
+      ads: safeJson(adsField),
+      audience_geo: ap.geo || null,
+      audience_gender_age: safeJson(ap.gender_age_distribution),
+      community_psychotype: comm.audience_psychotype || null,
+      community_content_risks: safeJson(comm.content_risks),
+      advertising_brand_safety: adv.brand_safety_risk || null,
+      advertising_tone_of_voice: safeJson(adv.tone_of_voice),
+      advertising_monetization_model: safeJson(adv.monetization_model),
+      advertising_ad_report: safeJson(adv.ad_report),
+      advertising_communication_strategy_tips: adv.communication_strategy_tips || null,
+      advertising_stats_comment: adv.stats_comment || null,
+      raw_json: typeof raw === "string" ? raw : safeJson(raw)
+    };
+    this.statements.upsertResult.run(payload);
+  }
+
   async writeInputBundles(targetDir = null) {
     const baseDir = targetDir || TMP_ROOT;
     await fs.mkdir(baseDir, { recursive: true });
@@ -491,7 +630,10 @@ async function main() {
     };
     const promptText = await fs.readFile(PROMPT_PATH, "utf8");
 
-    const { parsed } = await handler.callGemini(promptText, input, images);
+    const { parsed, raw } = await handler.callGemini(promptText, input, images);
+
+    // Сохраняем результат в БД
+    handler.saveResult(channelRow.chat_id, parsed, raw);
 
     await fs.mkdir(TMP_ROOT, { recursive: true });
     const outDir = await fs.mkdtemp(path.join(TMP_ROOT, "llm-output-"));

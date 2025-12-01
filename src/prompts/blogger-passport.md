@@ -36,7 +36,7 @@
 - `ads` (array of int): список рекламных сообщений (определи по содержанию постов: промокоды, ссылки на товар/услугу, явные интеграции).
 
 **3. `audience_profile` (object)**
-- `geo` (string): Заполни, если понятно, что канал относится к какому-то региону (город или страна). Иначе ''.
+- `geo` (string): Заполни, если понятно, что канал относится к какому-то региону (город или страна). Иначе '' (пустая строка).
 - `gender_age_distribution` (object):
   - Ключи — строки формата `"F18-24"`, `"M25-34"` и т.п.
   - Диапазоны: `12-17`, `18-24`, `25-34`, `35-44`, `45-54`, `55+`.
@@ -63,6 +63,58 @@
   как лучше заходить к блогеру, какие форматы рекламы подойдут и на каких уже выходивших интеграциях можно опираться.
 
 - `stats_comment` (string): проанализируй метрики и `engagement_summary`, кратко опиши состояние аудитории и качество вовлечения.
+
+### JSON Schema (соблюдай структуру)
+```json
+{
+  "type": "object",
+  "required": ["blogger_id", "content_summary", "audience_profile", "advertising_potential"],
+  "properties": {
+    "blogger_id": { "type": "string" },
+    "content_summary": {
+      "type": "object",
+      "required": ["short_description", "channel_format", "tags", "language", "contacts", "category"],
+      "properties": {
+        "short_description": { "type": "string" },
+        "channel_format": { "type": "string", "enum": ["blog", "newsfeed", "aggregator", "catalog", "review", "visual_gallery"] },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "language": { "type": "string" },
+        "contacts": { "type": ["string", "null"] },
+        "category": { "type": "array", "items": { "type": "string" } },
+        "ads": { "type": "array", "items": { "type": "integer" } }
+      }
+    },
+    "audience_profile": {
+      "type": "object",
+      "required": ["geo", "gender_age_distribution"],
+      "properties": {
+        "geo": { "type": "string" },
+        "gender_age_distribution": { "type": "object" },
+        "community": {
+          "type": "object",
+          "properties": {
+            "audience_psychotype": { "type": "string" },
+            "content_risks": { "type": "array", "items": { "type": "string" } }
+          }
+        }
+      }
+    },
+    "advertising_potential": {
+      "type": "object",
+      "required": ["brand_safety_risk", "tone_of_voice", "monetization_model", "ad_report", "communication_strategy_tips", "stats_comment"],
+      "properties": {
+        "brand_safety_risk": { "type": "string", "enum": ["green", "yellow", "red"] },
+        "tone_of_voice": { "type": "array", "items": { "type": "string" } },
+        "monetization_model": { "type": "array", "items": { "type": "string" } },
+        "ad_report": { "type": ["object", "string", "null"] },
+        "communication_strategy_tips": { "type": ["string", "null"] },
+        "stats_comment": { "type": ["string", "null"] }
+      }
+    },
+    "ads": { "type": "array", "items": { "type": "integer" } }
+  }
+}
+```
 
 ### Пример ответа
 
