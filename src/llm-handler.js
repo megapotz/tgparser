@@ -20,6 +20,54 @@ const DEFAULT_MODEL_ID = process.env.GEMINI_MODEL_ID || "gemini-2.5-pro";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || null;
 const TMP_ROOT = path.join(process.cwd(), "tmp");
 const PROMPT_PATH = path.join(__dirname, "prompts", "blogger-passport.md");
+const OUTPUT_SCHEMA = {
+  type: "object",
+  required: ["blogger_id", "content_summary", "audience_profile", "advertising_potential"],
+  properties: {
+    blogger_id: { type: "string" },
+    ads: { type: "array", items: { type: "integer" } },
+    content_summary: {
+      type: "object",
+      required: ["short_description", "channel_format", "tags", "language", "contacts", "category"],
+      properties: {
+        short_description: { type: "string" },
+        channel_format: { type: "string", enum: ["blog", "newsfeed", "aggregator", "catalog", "review", "visual_gallery"] },
+        tags: { type: "array", items: { type: "string" } },
+        language: { type: "string" },
+        contacts: { type: ["string", "null"] },
+        category: { type: "array", items: { type: "string" } },
+        ads: { type: "array", items: { type: "integer" } }
+      }
+    },
+    audience_profile: {
+      type: "object",
+      required: ["geo", "gender_age_distribution"],
+      properties: {
+        geo: { type: "string" },
+        gender_age_distribution: { type: "object" },
+        community: {
+          type: "object",
+          properties: {
+            audience_psychotype: { type: "string" },
+            content_risks: { type: "array", items: { type: "string" } }
+          }
+        }
+      }
+    },
+    advertising_potential: {
+      type: "object",
+      required: ["brand_safety_risk", "tone_of_voice", "monetization_model", "ad_report", "communication_strategy_tips", "stats_comment"],
+      properties: {
+        brand_safety_risk: { type: "string", enum: ["green", "yellow", "red"] },
+        tone_of_voice: { type: "array", items: { type: "string" } },
+        monetization_model: { type: "array", items: { type: "string" } },
+        ad_report: { type: ["object", "string", "null"] },
+        communication_strategy_tips: { type: ["string", "null"] },
+        stats_comment: { type: ["string", "null"] }
+      }
+    }
+  }
+};
 
 const CHANNEL_FIELDS = new Set([
   "active_username",
@@ -516,19 +564,23 @@ class GeminiHandler {
       parts.push({ inlineData: img.inlineData });
     }
 
-    const response = await this.model.generateContent(parts);
+    const response = await this.model.generateContent({
+      contents: parts,
+      generationConfig: {
+        responseMimeType: "application/json",
+        responseJsonSchema: OUTPUT_SCHEMA
+      }
+    });
 
-    const text = response?.response?.text?.() || response?.response?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    const match = text.match(/\{[\s\S]*\}/);
-    const raw = match ? match[0] : text;
+    const rawText = response?.response?.text?.() || response?.response?.candidates?.[0]?.content?.parts?.[0]?.text || "";
     let parsed = null;
     try {
-      parsed = JSON.parse(raw);
+      parsed = JSON.parse(rawText);
     } catch (_) {
-      parsed = { _raw: text };
+      parsed = { _raw: rawText };
     }
 
-    return { parsed, raw: text };
+    return { parsed, raw: rawText };
   }
 
   saveResult(chatId, parsed, raw) {
