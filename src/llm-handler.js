@@ -210,12 +210,11 @@ class GeminiHandler {
     this.db = new DatabaseSync(dbPath);
     this.modelId = modelId;
     this.apiKey = apiKey;
-    this.model = null;
+    this.client = null;
 
     if (this.apiKey && GoogleGenAI) {
       try {
-        const client = new GoogleGenAI({ apiKey: this.apiKey });
-        this.model = client.getGenerativeModel({ model: this.modelId });
+        this.client = new GoogleGenAI({ apiKey: this.apiKey });
       } catch (error) {
         // Локальная подготовка должна работать даже без валидного ключа
         console.warn("Gemini client init skipped:", error.message || error);
@@ -553,8 +552,8 @@ class GeminiHandler {
   }
 
   async callGemini(promptText, inputObject, imagePaths = []) {
-    if (!this.model) {
-      throw new Error("Gemini model is not initialized; install @google/generative-ai and set GEMINI_API_KEY");
+    if (!this.client) {
+      throw new Error("Gemini client is not initialized; install @google/genai and set GEMINI_API_KEY");
     }
 
     const payloadString = JSON.stringify(inputObject, null, 2);
@@ -564,9 +563,10 @@ class GeminiHandler {
       parts.push({ inlineData: img.inlineData });
     }
 
-    const response = await this.model.generateContent({
+    const response = await this.client.models.generateContent({
+      model: this.modelId,
       contents: parts,
-      generationConfig: {
+      config: {
         responseMimeType: "application/json",
         responseJsonSchema: OUTPUT_SCHEMA
       }
