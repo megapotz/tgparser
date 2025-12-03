@@ -13,6 +13,39 @@
   </header>
 
   <main>
+    <section class="filters">
+      <div class="filter-field">
+        <label>Поиск</label>
+        <input type="text" id="filter-search" placeholder="Название или @username" />
+      </div>
+      <div class="filter-field">
+        <label>Мин. подписчиков</label>
+        <input type="number" id="filter-subs" placeholder="100000" />
+      </div>
+      <div class="filter-field">
+        <label>Мин. Avg Views</label>
+        <input type="number" id="filter-views" placeholder="50000" />
+      </div>
+      <div class="filter-field">
+        <label>Категория</label>
+        <select id="filter-category"></select>
+      </div>
+      <div class="filter-field">
+        <label>Тег</label>
+        <select id="filter-tag"></select>
+      </div>
+      <div class="filter-field">
+        <label>Тип</label>
+        <select id="filter-format"></select>
+      </div>
+      <div class="filter-checks">
+        <label><input type="checkbox" id="filter-rkn" /> RKN</label>
+        <label><input type="checkbox" id="filter-verified" /> Verified</label>
+        <label><input type="checkbox" id="filter-paid" /> Wealth signal</label>
+      </div>
+      <button id="filters-reset">Сброс</button>
+    </section>
+
     <section id="channels-section">
       <div class="section-header">
         <h2>Список каналов</h2>
@@ -24,6 +57,9 @@
             <tr>
               <th data-sort="title">Название</th>
               <th data-sort="username">Username</th>
+              <th data-sort="format">Тип</th>
+              <th data-sort="category">Категории</th>
+              <th data-sort="tags">Теги</th>
               <th data-sort="members">Подписчики</th>
               <th data-sort="posts">Постов</th>
               <th data-sort="avg_views">Avg Views</th>

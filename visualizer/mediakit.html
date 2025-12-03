@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Медиакит Telegram-канала</title>
+  <link rel="stylesheet" href="mediakit.css" />
+</head>
+<body>
+  <div class="page">
+    <div class="nav-bar">
+      <a href="#" id="nav-prev" class="nav-link">←</a>
+      <div class="muted mini">Листайте ←/→</div>
+      <a href="#" id="nav-next" class="nav-link">→</a>
+    </div>
+
+    <div class="bento">
+      <div class="card span-8" id="identity-card">
+        <div class="section-head">
+          <div class="identity">
+            <div class="avatar" id="avatar">TG</div>
+            <div>
+              <h2 id="channel-title">Канал</h2>
+              <div class="subline" id="channel-link"></div>
+            </div>
+          </div>
+          <div class="badge-group" id="trust-badges"></div>
+        </div>
+        <div class="statline" id="pills"></div>
+        <div class="metrics-grid" id="puzomerki"></div>
+        <div class="tags" id="tags"></div>
+      </div>
+
+      <div class="card span-4 contact-box">
+        <div class="section-head">
+          <h3>Связь с администратором</h3>
+          <div class="badge-group" id="contact-flags"></div>
+        </div>
+        <div id="contact-actions" class="contact-actions"></div>
+        <label class="muted">Стоимость поста, ₽</label>
+        <input type="number" id="price-input" placeholder="Например 150000" />
+        <div class="muted" id="price-meta">Avg. Views: – • CPM: –</div>
+      </div>
+
+      <div class="card span-4">
+        <h3>ИИ описание</h3>
+        <div class="badge-group" id="format-badges"></div>
+        <div class="stacked">
+          <div class="labelled">Канал</div>
+          <div class="pill" id="short-description"></div>
+          <div class="labelled">Аудитория</div>
+          <div class="pill" id="psychotype"></div>
+          <div class="labelled">Комментарий по статистике</div>
+          <div class="pill" id="stats-comment"></div>
+        </div>
+      </div>
+
+      <div class="card span-4">
+        <h3>Brand Safety</h3>
+        <div id="brand-flag"></div>
+        <div class="labelled">TOV</div>
+        <div class="tags" id="tone-tags"></div>
+        <div class="labelled">Анализ контента</div>
+        <div class="text-block" id="content-summary"></div>
+        <div class="labelled">Анализ комментариев</div>
+        <div class="tags" id="risk-tags"></div>
+        <div class="hint" id="comments-hint"></div>
+      </div>
+
+      <div class="card span-4">
+        <h3>Рекомендации по рекламе</h3>
+        <div class="labelled">Возможная монетизация</div>
+        <ul class="list" id="monetization-list"></ul>
+        <div class="labelled">Рекомендации по общению</div>
+        <div class="text-block" id="rec-communication"></div>
+        <div class="labelled">Отчет о размещениях</div>
+        <div class="text-block" id="rec-report"></div>
+      </div>
+
+      <div class="card span-7">
+        <div class="section-head">
+          <h3>Язык, пол, возраст</h3>
+          <div class="toggle" id="gender-toggle">
+            <button data-mode="all" class="active">Все</button>
+            <button data-mode="men">М</button>
+            <button data-mode="women">Ж</button>
+          </div>
+        </div>
+        <div class="badge-group" id="language-geo"></div>
+        <div class="age-bars" id="age-bars"></div>
+        <div class="pie-wrap" style="margin-top:12px;">
+          <canvas id="gender-pie" width="120" height="120"></canvas>
+          <ul class="legend" id="gender-legend"></ul>
+        </div>
+      </div>
+
+      <div class="card span-5">
+        <div class="section-head">
+          <h3>Метрики (30д)</h3>
+          <div class="muted" id="coverage"></div>
+        </div>
+        <div class="pie-wrap">
+          <canvas id="content-pie" width="140" height="140"></canvas>
+          <ul class="legend" id="content-legend"></ul>
+        </div>
+        <table class="table-metrics" id="metrics-table">
+          <thead>
+            <tr><th>Метрика</th><th>Органика</th><th>Реклама</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <div class="card row-span">
+        <div class="section-head">
+          <h3>Примеры рекламных интеграций</h3>
+          <div class="hint">Если примеров нет — блок скрывается</div>
+        </div>
+        <div class="grid-scroll" id="ads-row"></div>
+      </div>
+
+      <div class="card row-span">
+        <div class="section-head">
+          <h3>Примеры постов и комментарии</h3>
+        </div>
+        <div class="grid-two">
+          <div>
+            <div class="labelled">Посты</div>
+            <div class="grid-scroll" id="posts-row"></div>
+          </div>
+          <div>
+            <div class="labelled">Комментарии</div>
+            <div class="grid-scroll" id="comments-box"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="mediakit.js"></script>
+</body>
+</html>

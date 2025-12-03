@@ -4,6 +4,12 @@ header { padding: 16px 20px; border-bottom: 1px solid #1d2835; background: #0f16
 h1 { margin: 0 0 6px; font-size: 22px; }
 p { margin: 0; color: #9fb1c7; }
 main { padding: 16px 20px 40px; }
+.filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; align-items: end; margin-bottom: 12px; }
+.filter-field { display: flex; flex-direction: column; gap: 4px; }
+.filter-field label { font-size: 12px; color: #9fb1c7; }
+.filter-field input, .filter-field select { background: #0f1623; border: 1px solid #1d2835; color: #e8ecf4; border-radius: 8px; padding: 8px; }
+.filter-checks { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.filter-checks label { font-size: 13px; color: #e8ecf4; display: flex; gap: 6px; align-items: center; }
 .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
 .section-header h2 { margin: 0; font-size: 18px; }
 .table-wrap { overflow: auto; border: 1px solid #1d2835; border-radius: 8px; }

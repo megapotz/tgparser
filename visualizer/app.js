@@ -1,16 +1,32 @@
 const tableBody = document.querySelector("#channels-table tbody");
 const tableHead = document.querySelector("#channels-table thead");
-const detailSection = document.getElementById("detail-section");
-const detailTitle = document.getElementById("detail-title");
-const meta = document.getElementById("meta");
-const postsEl = document.getElementById("posts");
-const pieCanvas = document.getElementById("type-pie");
-const legendEl = document.getElementById("type-legend");
-const barsCanvas = document.getElementById("bars");
 const refreshBtn = document.getElementById("refresh-btn");
+const filterEls = {
+  search: document.getElementById("filter-search"),
+  subs: document.getElementById("filter-subs"),
+  views: document.getElementById("filter-views"),
+  category: document.getElementById("filter-category"),
+  tag: document.getElementById("filter-tag"),
+  format: document.getElementById("filter-format"),
+  rkn: document.getElementById("filter-rkn"),
+  verified: document.getElementById("filter-verified"),
+  paid: document.getElementById("filter-paid"),
+  reset: document.getElementById("filters-reset")
+};
 
 let channelsCache = [];
 let sortState = { key: "title", dir: "asc" };
+let filterState = {
+  search: "",
+  subs: "",
+  views: "",
+  category: "",
+  tag: "",
+  format: "",
+  rkn: false,
+  verified: false,
+  paid: false
+};
 
 async function fetchJson(url) {
   const res = await fetch(url);
@@ -30,18 +46,105 @@ function formatPct(value) {
   return (value * 100).toFixed(2) + "%";
 }
 
-async function loadChannels() {
-  const data = await fetchJson("/api/channels");
-  channelsCache = data.channels;
-  renderChannels();
+function readFiltersFromQuery() {
+  const params = new URLSearchParams(window.location.search);
+  filterState.search = params.get("q") || "";
+  filterState.subs = params.get("subs") || "";
+  filterState.views = params.get("views") || "";
+  filterState.category = params.get("category") || "";
+  filterState.tag = params.get("tag") || "";
+  filterState.format = params.get("format") || "";
+  filterState.rkn = params.get("rkn") === "1";
+  filterState.verified = params.get("verified") === "1";
+  filterState.paid = params.get("paid") === "1";
 }
 
-function sortChannels() {
+function syncFiltersToUI() {
+  filterEls.search.value = filterState.search;
+  filterEls.subs.value = filterState.subs;
+  filterEls.views.value = filterState.views;
+  filterEls.category.value = filterState.category;
+  filterEls.tag.value = filterState.tag;
+  filterEls.format.value = filterState.format;
+  filterEls.rkn.checked = filterState.rkn;
+  filterEls.verified.checked = filterState.verified;
+  filterEls.paid.checked = filterState.paid;
+}
+
+function updateQuery() {
+  const params = new URLSearchParams();
+  if (filterState.search) params.set("q", filterState.search);
+  if (filterState.subs) params.set("subs", filterState.subs);
+  if (filterState.views) params.set("views", filterState.views);
+  if (filterState.category) params.set("category", filterState.category);
+  if (filterState.tag) params.set("tag", filterState.tag);
+  if (filterState.format) params.set("format", filterState.format);
+  if (filterState.rkn) params.set("rkn", "1");
+  if (filterState.verified) params.set("verified", "1");
+  if (filterState.paid) params.set("paid", "1");
+  const qs = params.toString();
+  const newUrl = qs ? `${window.location.pathname}?${qs}` : window.location.pathname;
+  window.history.replaceState(null, "", newUrl);
+}
+
+function collectOptions() {
+  const categories = new Set();
+  const tags = new Set();
+  const formats = new Set();
+  channelsCache.forEach((c) => {
+    (c.categories || []).forEach((v) => categories.add(v));
+    (c.tags || []).forEach((v) => tags.add(v));
+    if (c.format) formats.add(c.format);
+  });
+  const toOptions = (set) => ["", ...Array.from(set).sort()];
+  return { categories: toOptions(categories), tags: toOptions(tags), formats: toOptions(formats) };
+}
+
+function fillSelect(el, options, placeholder, selected) {
+  const opts = [...options];
+  if (selected && !opts.includes(selected)) opts.unshift(selected);
+  el.innerHTML = opts.map((opt) => `<option value="${opt}">${opt || placeholder}</option>`).join("");
+}
+
+function applyFilters(list) {
+  const search = filterState.search.trim().toLowerCase();
+  const minSubs = Number(filterState.subs) || 0;
+  const minViews = Number(filterState.views) || 0;
+  const category = filterState.category;
+  const tag = filterState.tag;
+  const format = filterState.format;
+  const norm = (v) => (v || "").toString().trim().toLowerCase();
+  const matchAny = (needle, hay) => {
+    if (!needle) return true;
+    const target = norm(needle);
+    return (hay || []).some((v) => norm(v) === target);
+  };
+  return list.filter((c) => {
+    if (search) {
+      const hay = `${c.title || ""} ${c.active_username || ""}`.toLowerCase();
+      if (!hay.includes(search)) return false;
+    }
+    if (minSubs && (c.member_count || 0) < minSubs) return false;
+    if (minViews && (c.summary.avg_views || 0) < minViews) return false;
+    if (filterState.rkn && !c.is_rkn) return false;
+    if (filterState.verified && !c.is_verified) return false;
+    if (filterState.paid && !c.summary.has_paid) return false;
+    if (!matchAny(category, c.categories)) return false;
+    if (!matchAny(tag, c.tags)) return false;
+    if (format && norm(c.format) !== norm(format)) return false;
+    return true;
+  });
+}
+
+function sortChannels(list) {
   const { key, dir } = sortState;
   const factor = dir === "desc" ? -1 : 1;
   const accessor = {
     title: (c) => (c.title || "").toLowerCase(),
     username: (c) => (c.active_username || "").toLowerCase(),
+    format: (c) => (c.format || "").toLowerCase(),
+    category: (c) => ((c.categories || [])[0] || "").toLowerCase(),
+    tags: (c) => ((c.tags || [])[0] || "").toLowerCase(),
     members: (c) => c.member_count || 0,
     posts: (c) => c.summary.total || 0,
     avg_views: (c) => c.summary.avg_views || 0,
@@ -49,7 +152,7 @@ function sortChannels() {
     ads: (c) => c.summary.ads || 0
   }[key];
 
-  return [...channelsCache].sort((a, b) => {
+  return [...list].sort((a, b) => {
     const av = accessor ? accessor(a) : 0;
     const bv = accessor ? accessor(b) : 0;
     if (typeof av === "string" && typeof bv === "string") return av.localeCompare(bv) * factor;
@@ -58,13 +161,17 @@ function sortChannels() {
 }
 
 function renderChannels() {
-  const channels = sortChannels();
+  const filtered = applyFilters(channelsCache);
+  const channels = sortChannels(filtered);
   tableBody.innerHTML = "";
   channels.forEach((ch) => {
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td>${ch.title || ""}</td>
       <td>${ch.active_username || ""}</td>
+      <td>${ch.format || "–"}</td>
+      <td>${(ch.categories || []).join(", ")}</td>
+      <td>${(ch.tags || []).join(", ")}</td>
       <td>${formatNumber(ch.member_count)}</td>
       <td>${ch.summary.total}</td>
       <td>${formatNumber(Math.round(ch.summary.avg_views || 0))}</td>
@@ -72,7 +179,8 @@ function renderChannels() {
       <td>${ch.summary.ads}</td>
     `;
     tr.addEventListener("click", () => {
-      window.location.href = `/channel.html?id=${encodeURIComponent(ch.chat_id)}`;
+      const id = ch.active_username || ch.chat_id;
+      window.location.href = `/mediakit.html?id=${encodeURIComponent(id)}`;
     });
     tableBody.appendChild(tr);
   });
@@ -90,97 +198,61 @@ function handleSortClick(e) {
   renderChannels();
 }
 
-function drawPie(canvas, data) {
-  const ctx = canvas.getContext("2d");
-  const total = data.reduce((acc, item) => acc + item.count, 0) || 1;
-  let start = 0;
-  const colors = ["#60a5fa", "#22d3ee", "#a78bfa", "#f59e0b", "#f472b6", "#34d399"];
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  const radius = Math.min(canvas.width, canvas.height) / 2 - 8;
-  const cx = canvas.width / 2;
-  const cy = canvas.height / 2;
-
-  data.forEach((item, idx) => {
-    const slice = (item.count / total) * Math.PI * 2;
-    const end = start + slice;
-    ctx.beginPath();
-    ctx.moveTo(cx, cy);
-    ctx.arc(cx, cy, radius, start, end);
-    ctx.closePath();
-    ctx.fillStyle = colors[idx % colors.length];
-    ctx.fill();
-    start = end;
-  });
-
-  legendEl.innerHTML = data
-    .map((item, idx) => {
-      const color = colors[idx % colors.length];
-      const pct = ((item.count / total) * 100).toFixed(1);
-      const er = item.avg_er !== null && item.avg_er !== undefined ? `${(item.avg_er * 100).toFixed(2)}%` : "–";
-      return `<li><span class="dot" style="background:${color}"></span>${item.type} — ${pct}% • ER ${er}</li>`;
-    })
-    .join("");
-}
-
-function drawBars(canvas, messages) {
-  const ctx = canvas.getContext("2d");
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  const maxVal = Math.max(
-    1,
-    ...messages.map((m) => Math.max(m.reactions_total || 0, m.reply_count || 0, m.forward_count || 0))
-  );
-  const pad = 10;
-  const barWidth = Math.max(4, (canvas.width - pad * 2) / messages.length - 2);
-  messages.forEach((m, idx) => {
-    const x = pad + idx * (barWidth + 2);
-    const scales = [
-      { val: m.reactions_total || 0, color: "#60a5fa" },
-      { val: m.reply_count || 0, color: "#f59e0b" },
-      { val: m.forward_count || 0, color: "#a78bfa" }
-    ];
-    scales.forEach((s, i) => {
-      const h = (s.val / maxVal) * (canvas.height - pad * 2);
-      ctx.fillStyle = s.color;
-      ctx.fillRect(x + i * (barWidth / 3), canvas.height - pad - h, barWidth / 3 - 1, h);
+function bindFilters() {
+  const onChange = () => {
+    filterState = {
+      search: filterEls.search.value,
+      subs: filterEls.subs.value,
+      views: filterEls.views.value,
+      category: filterEls.category.value,
+      tag: filterEls.tag.value,
+      format: filterEls.format.value,
+      rkn: filterEls.rkn.checked,
+      verified: filterEls.verified.checked,
+      paid: filterEls.paid.checked
+    };
+    updateQuery();
+    renderChannels();
+  };
+  Object.values(filterEls)
+    .filter((el) => el && el !== filterEls.reset)
+    .forEach((el) => {
+      el.addEventListener("input", onChange);
+      el.addEventListener("change", onChange);
     });
+  filterEls.reset.addEventListener("click", () => {
+    filterState = {
+      search: "",
+      subs: "",
+      views: "",
+      category: "",
+      tag: "",
+      format: "",
+      rkn: false,
+      verified: false,
+      paid: false
+    };
+    syncFiltersToUI();
+    updateQuery();
+    renderChannels();
   });
 }
 
-function renderPosts(messages) {
-  postsEl.innerHTML = "";
-  messages.slice(0, 60).forEach((m) => {
-    const div = document.createElement("div");
-    div.className = "post";
-    const date = m.date ? new Date(m.date).toLocaleString() : "";
-    const meta = [
-      `views ${formatNumber(m.view_count)}`,
-      `ER ${formatPct(m.er)}`,
-      m.content_type,
-      m.is_ad ? "Реклама" : null
-    ].filter(Boolean);
-    const imgs = m.media_url ? [m.media_url] : m.image_urls || [];
-    div.innerHTML = `
-      <h4>${date}</h4>
-      <div class="meta">${meta.map((t) => `<span class="badge">${t}</span>`).join(" ")}</div>
-      <p>${(m.text_preview || "").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</p>
-      ${imgs.length ? `<img class="preview" src="${imgs[0]}" alt="preview" />` : ""}
-    `;
-    postsEl.appendChild(div);
-  });
+async function loadChannels() {
+  const data = await fetchJson("/api/channels");
+  readFiltersFromQuery();
+  channelsCache = data.channels;
+  const opts = collectOptions();
+  fillSelect(filterEls.category, opts.categories, "Все категории", filterState.category);
+  fillSelect(filterEls.tag, opts.tags, "Все теги", filterState.tag);
+  fillSelect(filterEls.format, opts.formats, "Все типы", filterState.format);
+  syncFiltersToUI();
+  renderChannels();
 }
 
-async function loadDetail(chatId) {
-  const data = await fetchJson(`/api/channels/${chatId}`);
-  detailTitle.textContent = `${data.channel.title || ""} (${data.channel.active_username || data.channel.chat_id})`;
-  meta.textContent = `Подписчики: ${formatNumber(data.channel.member_count)} • Сообщений: ${data.summary.total} • Avg Views: ${formatNumber(Math.round(data.summary.avg_views || 0))} • Avg ER: ${formatPct(data.summary.avg_er)} • Ads: ${data.summary.ads}`;
-
-  const pieData = data.summary.types.length ? data.summary.types : [{ type: "unknown", count: 1, avg_er: null }];
-  drawPie(pieCanvas, pieData);
-  drawBars(barsCanvas, data.messages);
-  renderPosts(data.messages);
-  detailSection.classList.remove("hidden");
-}
-
+readFiltersFromQuery();
+syncFiltersToUI();
+bindFilters();
 refreshBtn.addEventListener("click", loadChannels);
 tableHead.addEventListener("click", handleSortClick);
 loadChannels().catch((err) => alert(err.message));
